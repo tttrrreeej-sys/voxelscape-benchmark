@@ -1,0 +1,1846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>VOXELSCAPE — procedural voxel world (raw WebGL2, zero dependencies)</title>
+<style>
+  :root { --fg: #e8f0ff; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #05070d; }
+  #gl { display: block; width: 100vw; height: 100vh; }
+  #hud {
+    position: fixed; top: 12px; left: 12px; z-index: 10;
+    font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--fg); text-shadow: 0 1px 2px rgba(0,0,0,.8);
+    background: rgba(8, 12, 22, .42);
+    border: 1px solid rgba(140, 180, 255, .18);
+    border-radius: 10px; padding: 10px 13px; backdrop-filter: blur(8px);
+    pointer-events: none; min-width: 196px;
+  }
+  #hud .title { font-size: 13px; letter-spacing: .12em; color: #9fc4ff; margin-bottom: 6px; }
+  #hud .row { display: flex; justify-content: space-between; gap: 18px; }
+  #hud .row span:last-child { color: #fff; font-variant-numeric: tabular-nums; }
+  #hud .bar { height: 5px; margin-top: 7px; border-radius: 3px; overflow: hidden;
+    background: linear-gradient(90deg,#0b1730,#101c33); border:1px solid rgba(120,160,240,.2); }
+  #hud .bar > i { display:block; height:100%; width:40%;
+    background: linear-gradient(90deg,#1b2c52,#7fb4ff); transition: width .3s ease; }
+  #note {
+    position: fixed; bottom: 12px; left: 12px; z-index: 10;
+    font: 11px/1.4 ui-monospace, monospace; color: rgba(200,216,255,.55);
+    text-shadow: 0 1px 2px rgba(0,0,0,.8); pointer-events:none;
+  }
+  #err {
+    position: fixed; inset: 0; z-index: 50; display:none;
+    align-items:center; justify-content:center; padding:32px;
+    font: 14px/1.6 ui-monospace, monospace; color:#ffd7d7;
+    background: rgba(20,4,8,.92); white-space:pre-wrap;
+  }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="map" width="150" height="150" style="position:fixed;top:12px;right:12px;z-index:10;width:150px;height:150px;border-radius:10px;border:1px solid rgba(140,180,255,.18);background:rgba(8,12,22,.42);backdrop-filter:blur(8px);pointer-events:none;"></canvas>
+<div id="hud">
+  <div class="title">VOXELSCAPE</div>
+  <div class="row"><span>fps</span><span id="h-fps">--</span></div>
+  <div class="row"><span>voxels</span><span id="h-vox">--</span></div>
+  <div class="row"><span>triangles</span><span id="h-tri">--</span></div>
+  <div class="row"><span>draw calls</span><span id="h-dc">--</span></div>
+  <div class="row"><span>time</span><span id="h-tod">--</span></div>
+  <div class="bar"><i id="h-bar"></i></div>
+</div>
+<div id="note">raw WebGL2 · procedural terrain · shadow-mapped · post-processed · no libraries</div>
+<div id="err"></div>
+
+<script>
+"use strict";
+/* =====================================================================================
+   VOXELSCAPE  —  a self-contained procedural voxel world.
+
+   Everything here is hand-written against raw WebGL2. No three.js, no images, no fonts,
+   no network. The pipeline, from the ground up:
+
+     1.  a small column-major mat4 / vec3 layer (+ matrix inverse, ortho, perspective)
+     2.  a deterministic PRNG, hash value-noise for textures, and classic Perlin
+         gradient noise (with a permutation table) + fbm / ridged / domain-warp on top
+     3.  a chunked voxel volume generated from a layered height field with an island mask
+     4.  a procedural texture atlas painted on a 2D canvas (grass, dirt, stone, sand,
+         snow, bark, wood rings, leaves) plus alpha-cut decoration tiles (blades, flowers)
+     5.  a face-culling mesher that emits only exposed faces with baked ambient occlusion
+     6.  a cross-quad decoration mesh (grass tufts and flowers) with alpha discard
+     7.  a sun-space depth pass feeding a 3x3 PCF shadow map
+     8.  the lit scene pass (sky -> terrain -> decorations -> transparent water -> particles)
+         rendered into an offscreen color target
+     9.  GPU particle systems: a wheeling flock of birds and drifting pollen motes
+     10. a full-screen post pass: ACES tonemap, vignette, subtle saturation, gamma
+     11. a day/night cycle that drives sun direction, sky palette, stars, and the moon
+
+   The camera flies itself on a slow orbit, so the scene can be judged purely by eye.
+   ===================================================================================== */
+
+(function () {
+
+/* -------------------------------------------------------------------------------------
+   0. Tiny helpers + fatal error overlay
+   ------------------------------------------------------------------------------------- */
+const $ = (id) => document.getElementById(id);
+function fatal(msg) {
+  const e = $("err");
+  e.style.display = "flex";
+  e.textContent = "VOXELSCAPE could not start:\n\n" + msg;
+  throw new Error(msg);
+}
+const clamp = (x, a, b) => x < a ? a : (x > b ? b : x);
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (t) => t * t * (3 - 2 * t);
+const fade = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+const fract = (x) => x - Math.floor(x);
+const TAU = Math.PI * 2;
+
+/* -------------------------------------------------------------------------------------
+   1. Linear algebra — mat4 + vec3, column-major, written by hand
+   ------------------------------------------------------------------------------------- */
+const M4 = {
+  create() { return new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]); },
+  perspective(o, fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
+    o[0]=f/aspect; o[1]=0; o[2]=0; o[3]=0;
+    o[4]=0; o[5]=f; o[6]=0; o[7]=0;
+    o[8]=0; o[9]=0; o[10]=(far+near)*nf; o[11]=-1;
+    o[12]=0; o[13]=0; o[14]=2*far*near*nf; o[15]=0; return o;
+  },
+  ortho(o, l, r, b, t, near, far) {
+    const lr = 1/(l-r), bt = 1/(b-t), nf = 1/(near-far);
+    o[0]=-2*lr; o[1]=0; o[2]=0; o[3]=0;
+    o[4]=0; o[5]=-2*bt; o[6]=0; o[7]=0;
+    o[8]=0; o[9]=0; o[10]=2*nf; o[11]=0;
+    o[12]=(l+r)*lr; o[13]=(t+b)*bt; o[14]=(far+near)*nf; o[15]=1; return o;
+  },
+  lookAt(o, eye, center, up) {
+    let ex=eye[0],ey=eye[1],ez=eye[2];
+    let zx=ex-center[0], zy=ey-center[1], zz=ez-center[2];
+    let zl=1/Math.hypot(zx,zy,zz); zx*=zl; zy*=zl; zz*=zl;
+    let xx=up[1]*zz-up[2]*zy, xy=up[2]*zx-up[0]*zz, xz=up[0]*zy-up[1]*zx;
+    let xl=Math.hypot(xx,xy,xz); if(xl===0){xx=0;xy=0;xz=0;} else {xl=1/xl; xx*=xl;xy*=xl;xz*=xl;}
+    let yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+    o[0]=xx;o[1]=yx;o[2]=zx;o[3]=0;
+    o[4]=xy;o[5]=yy;o[6]=zy;o[7]=0;
+    o[8]=xz;o[9]=yz;o[10]=zz;o[11]=0;
+    o[12]=-(xx*ex+xy*ey+xz*ez);
+    o[13]=-(yx*ex+yy*ey+yz*ez);
+    o[14]=-(zx*ex+zy*ey+zz*ez);
+    o[15]=1; return o;
+  },
+  multiply(o, a, b) {
+    for (let i=0;i<4;i++){
+      const ai0=a[i],ai1=a[i+4],ai2=a[i+8],ai3=a[i+12];
+      o[i]    = ai0*b[0]  + ai1*b[1]  + ai2*b[2]  + ai3*b[3];
+      o[i+4]  = ai0*b[4]  + ai1*b[5]  + ai2*b[6]  + ai3*b[7];
+      o[i+8]  = ai0*b[8]  + ai1*b[9]  + ai2*b[10] + ai3*b[11];
+      o[i+12] = ai0*b[12] + ai1*b[13] + ai2*b[14] + ai3*b[15];
+    }
+    return o;
+  },
+  invert(out, m) {
+    const a00=m[0],a01=m[1],a02=m[2],a03=m[3],
+          a10=m[4],a11=m[5],a12=m[6],a13=m[7],
+          a20=m[8],a21=m[9],a22=m[10],a23=m[11],
+          a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+    const b00=a00*a11-a01*a10, b01=a00*a12-a02*a10, b02=a00*a13-a03*a10,
+          b03=a01*a12-a02*a11, b04=a01*a13-a03*a11, b05=a02*a13-a03*a12,
+          b06=a20*a31-a21*a30, b07=a20*a32-a22*a30, b08=a20*a33-a23*a30,
+          b09=a21*a32-a22*a31, b10=a21*a33-a23*a31, b11=a22*a33-a23*a32;
+    let det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06;
+    if(!det) return out; det=1/det;
+    out[0]=(a11*b11-a12*b10+a13*b09)*det;  out[1]=(a02*b10-a01*b11-a03*b09)*det;
+    out[2]=(a31*b05-a32*b04+a33*b03)*det;  out[3]=(a22*b04-a21*b05-a23*b03)*det;
+    out[4]=(a12*b08-a10*b11-a13*b07)*det;  out[5]=(a00*b11-a02*b08+a03*b07)*det;
+    out[6]=(a32*b02-a30*b05-a33*b01)*det;  out[7]=(a20*b05-a22*b02+a23*b01)*det;
+    out[8]=(a10*b10-a11*b08+a13*b06)*det;  out[9]=(a01*b08-a00*b10-a03*b06)*det;
+    out[10]=(a30*b04-a31*b02+a33*b00)*det; out[11]=(a21*b02-a20*b04-a23*b00)*det;
+    out[12]=(a11*b07-a10*b09-a12*b06)*det; out[13]=(a00*b09-a01*b07+a02*b06)*det;
+    out[14]=(a31*b01-a30*b03-a32*b00)*det; out[15]=(a20*b03-a21*b01+a22*b00)*det;
+    return out;
+  }
+};
+const V3 = {
+  add:(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]],
+  sub:(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]],
+  scale:(a,s)=>[a[0]*s,a[1]*s,a[2]*s],
+  cross:(a,b)=>[a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]],
+  norm:(a)=>{const l=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/l,a[1]/l,a[2]/l];}
+};
+
+/* -------------------------------------------------------------------------------------
+   2. Deterministic PRNG + value noise (textures) + Perlin gradient noise (terrain)
+   ------------------------------------------------------------------------------------- */
+function makeRng(seed) {
+  let s = seed >>> 0;
+  return function () {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >> 17;
+    s ^= s << 5;  s >>>= 0;
+    return (s >>> 0) / 4294967296;
+  };
+}
+// --- hash-based value noise, used for procedural texture detail ---
+function hash2(x, y) {
+  let h = x * 374761393 + y * 668265263;
+  h = (h ^ (h >> 13)) * 1274126177;
+  h = h ^ (h >> 16);
+  return (h >>> 0) / 4294967296;
+}
+function valueNoise2(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const xf = x - xi, yf = y - yi;
+  const u = smooth(xf), v = smooth(yf);
+  const a = hash2(xi, yi),     b = hash2(xi + 1, yi);
+  const c = hash2(xi, yi + 1), d = hash2(xi + 1, yi + 1);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+function fbmValue(x, y, oct, lac, gain) {
+  let amp = 0.5, freq = 1, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    sum += amp * valueNoise2(x * freq, y * freq);
+    norm += amp; amp *= gain; freq *= lac;
+  }
+  return sum / norm;
+}
+
+// --- classic Perlin gradient noise with a shuffled permutation table ---
+const PERM = new Uint8Array(512);
+(function buildPerm() {
+  const p = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  const rng = makeRng(987654321);
+  for (let i = 255; i > 0; i--) {
+    const j = (rng() * (i + 1)) | 0;
+    const t = p[i]; p[i] = p[j]; p[j] = t;
+  }
+  for (let i = 0; i < 512; i++) PERM[i] = p[i & 255];
+})();
+function grad2(h, x, y) {
+  switch (h & 3) {
+    case 0: return  x + y;
+    case 1: return  x - y;
+    case 2: return -x + y;
+    default: return -x - y;
+  }
+}
+function perlin2(x, y) {
+  const X = Math.floor(x) & 255, Y = Math.floor(y) & 255;
+  const xf = x - Math.floor(x), yf = y - Math.floor(y);
+  const u = fade(xf), v = fade(yf);
+  const aa = PERM[PERM[X] + Y],       ab = PERM[PERM[X] + Y + 1];
+  const ba = PERM[PERM[X + 1] + Y],   bb = PERM[PERM[X + 1] + Y + 1];
+  const x1 = lerp(grad2(aa, xf, yf),     grad2(ba, xf - 1, yf), u);
+  const x2 = lerp(grad2(ab, xf, yf - 1), grad2(bb, xf - 1, yf - 1), u);
+  return (lerp(x1, x2, v) + 1) * 0.5; // -> [0,1]
+}
+function fbm(x, y, oct) {
+  let amp = 0.5, freq = 1, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    sum += amp * perlin2(x * freq, y * freq);
+    norm += amp; amp *= 0.5; freq *= 2.0;
+  }
+  return sum / norm;
+}
+function ridge(x, y, oct) {
+  let amp = 0.5, freq = 1, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    const n = 1 - Math.abs(perlin2(x * freq, y * freq) * 2 - 1);
+    sum += amp * n * n; norm += amp; amp *= 0.5; freq *= 2.0;
+  }
+  return sum / norm;
+}
+// domain warping: perturb the sample coordinates by another noise field
+function warpedFbm(x, y) {
+  const wx = fbm(x + 5.2, y + 1.3, 4);
+  const wy = fbm(x + 9.1, y + 4.7, 4);
+  return fbm(x + 4 * wx, y + 4 * wy, 5);
+}
+
+// 3D Perlin gradient noise (used to carve caves and seed ore veins)
+function grad3(h, x, y, z) {
+  switch (h & 15) {
+    case 0: return  x + y; case 1: return -x + y; case 2: return  x - y; case 3: return -x - y;
+    case 4: return  x + z; case 5: return -x + z; case 6: return  x - z; case 7: return -x - z;
+    case 8: return  y + z; case 9: return -y + z; case 10: return  y - z; case 11: return -y - z;
+    case 12: return  x + y; case 13: return -y + z; case 14: return -x + y; default: return -y - z;
+  }
+}
+function perlin3(x, y, z) {
+  const X = Math.floor(x) & 255, Y = Math.floor(y) & 255, Z = Math.floor(z) & 255;
+  const xf = x - Math.floor(x), yf = y - Math.floor(y), zf = z - Math.floor(z);
+  const u = fade(xf), v = fade(yf), w = fade(zf);
+  const A = PERM[X] + Y, AA = PERM[A] + Z, AB = PERM[A + 1] + Z;
+  const Bp = PERM[X + 1] + Y, BA = PERM[Bp] + Z, BB = PERM[Bp + 1] + Z;
+  const r = lerp(
+    lerp(lerp(grad3(PERM[AA], xf, yf, zf),         grad3(PERM[BA], xf - 1, yf, zf), u),
+         lerp(grad3(PERM[AB], xf, yf - 1, zf),     grad3(PERM[BB], xf - 1, yf - 1, zf), u), v),
+    lerp(lerp(grad3(PERM[AA + 1], xf, yf, zf - 1), grad3(PERM[BA + 1], xf - 1, yf, zf - 1), u),
+         lerp(grad3(PERM[AB + 1], xf, yf - 1, zf - 1), grad3(PERM[BB + 1], xf - 1, yf - 1, zf - 1), u), v),
+    w);
+  return (r + 1) * 0.5;
+}
+function fbm3(x, y, z, oct) {
+  let amp = 0.5, freq = 1, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) { sum += amp * perlin3(x*freq, y*freq, z*freq); norm += amp; amp *= 0.5; freq *= 2.0; }
+  return sum / norm;
+}
+
+/* -------------------------------------------------------------------------------------
+   3. Block + decoration palette
+   ------------------------------------------------------------------------------------- */
+const B = { AIR:0, GRASS:1, DIRT:2, STONE:3, SAND:4, SNOW:5, WOOD:6, LEAF:7, WATER:8,
+            GRAVEL:9, MOSSY:10, COAL:11, IRON:12, PINEWOOD:13, PINELEAF:14 };
+// atlas tile indices (vertical strip)
+const T = {
+  GRASS_TOP:0, GRASS_SIDE:1, DIRT:2, STONE:3, SAND:4, SNOW:5,
+  BARK:6, RINGS:7, LEAF:8, BLADE:9, FLOWER_R:10, FLOWER_Y:11,
+  GRAVEL:12, MOSSY:13, COAL:14, IRON:15, PINEBARK:16, PINELEAF:17,
+  MUSHROOM:18, DEADBUSH:19, FLOWER_W:20, FLOWER_B:21
+};
+const TILE_COUNT = 22;
+// face -> tile: [top, side, bottom]
+const FACE_TILES = {
+  [B.GRASS]: [T.GRASS_TOP, T.GRASS_SIDE, T.DIRT],
+  [B.DIRT]:  [T.DIRT, T.DIRT, T.DIRT],
+  [B.STONE]: [T.STONE, T.STONE, T.STONE],
+  [B.SAND]:  [T.SAND, T.SAND, T.SAND],
+  [B.SNOW]:  [T.SNOW, T.SNOW, T.SNOW],
+  [B.WOOD]:  [T.RINGS, T.BARK, T.RINGS],
+  [B.LEAF]:  [T.LEAF, T.LEAF, T.LEAF],
+  [B.GRAVEL]:[T.GRAVEL, T.GRAVEL, T.GRAVEL],
+  [B.MOSSY]: [T.MOSSY, T.MOSSY, T.MOSSY],
+  [B.COAL]:  [T.COAL, T.COAL, T.COAL],
+  [B.IRON]:  [T.IRON, T.IRON, T.IRON],
+  [B.PINEWOOD]: [T.RINGS, T.PINEBARK, T.RINGS],
+  [B.PINELEAF]: [T.PINELEAF, T.PINELEAF, T.PINELEAF],
+  [B.WATER]: [0,0,0]
+};
+
+/* -------------------------------------------------------------------------------------
+   4. Procedural texture atlas painted on a 2D canvas, uploaded as one GL texture.
+   ------------------------------------------------------------------------------------- */
+const TILE = 32;
+function buildAtlas() {
+  const cv = document.createElement("canvas");
+  cv.width = TILE; cv.height = TILE * TILE_COUNT;
+  const g = cv.getContext("2d");
+  const rng = makeRng(1337);
+
+  function noiseTile(ty, base, spread, mono) {
+    for (let y = 0; y < TILE; y++) {
+      for (let x = 0; x < TILE; x++) {
+        const n = fbmValue(x * 0.35 + ty * 11, y * 0.35, 4, 2, 0.5);
+        const d = (n - 0.5) * spread;
+        const r  = clamp(base[0] + d, 0, 255);
+        const gg = clamp(base[1] + d * (mono ? 1 : 0.9), 0, 255);
+        const b  = clamp(base[2] + d * (mono ? 1 : 0.7), 0, 255);
+        g.fillStyle = `rgb(${r|0},${gg|0},${b|0})`;
+        g.fillRect(x, ty * TILE + y, 1, 1);
+      }
+    }
+  }
+  // grass top
+  noiseTile(T.GRASS_TOP, [86, 142, 62], 60, false);
+  for (let i = 0; i < 80; i++) {
+    g.fillStyle = `rgba(${60+rng()*40|0},${120+rng()*60|0},${50+rng()*30|0},.7)`;
+    g.fillRect(rng()*TILE|0, rng()*TILE|0, 1, 1 + (rng()*2|0));
+  }
+  // grass side (dirt + grass lip)
+  noiseTile(T.GRASS_SIDE, [120, 92, 58], 50, false);
+  g.fillStyle = "rgba(86,142,62,1)";
+  for (let x = 0; x < TILE; x++) {
+    const h = 5 + (valueNoise2(x * 0.4, 99) * 4 | 0);
+    g.fillRect(x, TILE * T.GRASS_SIDE, 1, h);
+  }
+  noiseTile(T.DIRT, [124, 92, 56], 46, false);
+  noiseTile(T.STONE, [128, 128, 134], 44, true);
+  for (let i = 0; i < 26; i++) {
+    g.strokeStyle = "rgba(80,80,86,.5)";
+    g.beginPath();
+    g.moveTo(rng()*TILE, TILE*T.STONE + rng()*TILE);
+    g.lineTo(rng()*TILE, TILE*T.STONE + rng()*TILE);
+    g.stroke();
+  }
+  noiseTile(T.SAND, [214, 198, 142], 28, false);
+  noiseTile(T.SNOW, [236, 242, 252], 18, true);
+  noiseTile(T.BARK, [104, 74, 44], 34, false);
+  for (let y = 0; y < TILE; y++)
+    if ((y % 6) < 1) { g.fillStyle = "rgba(70,48,28,.55)"; g.fillRect(0, TILE*T.BARK+y, TILE, 1); }
+  noiseTile(T.RINGS, [150, 112, 70], 26, false);
+  g.strokeStyle = "rgba(96,68,40,.6)";
+  for (let r = 3; r < 16; r += 3) { g.beginPath(); g.arc(TILE/2, TILE*T.RINGS + TILE/2, r, 0, TAU); g.stroke(); }
+  noiseTile(T.LEAF, [54, 110, 48], 70, false);
+  for (let i = 0; i < 90; i++) {
+    g.fillStyle = `rgba(${30+rng()*40|0},${90+rng()*70|0},${30+rng()*30|0},.8)`;
+    g.fillRect(rng()*TILE|0, TILE*T.LEAF + (rng()*TILE|0), 1, 1);
+  }
+  // --- alpha-cut decoration tiles: clear to transparent, then paint shapes ---
+  // grass blade tuft
+  g.clearRect(0, TILE*T.BLADE, TILE, TILE);
+  for (let i = 0; i < 22; i++) {
+    const bx = 4 + rng() * (TILE - 8);
+    const bh = 10 + rng() * 16;
+    g.strokeStyle = `rgb(${60+rng()*40|0},${120+rng()*70|0},${50+rng()*30|0})`;
+    g.lineWidth = 1.4;
+    g.beginPath();
+    g.moveTo(bx, TILE*T.BLADE + TILE);
+    g.quadraticCurveTo(bx + (rng()-0.5)*8, TILE*T.BLADE + TILE - bh*0.5, bx + (rng()-0.5)*10, TILE*T.BLADE + TILE - bh);
+    g.stroke();
+  }
+  // red flower
+  function flower(ty, petal, center) {
+    g.clearRect(0, TILE*ty, TILE, TILE);
+    const cx = TILE/2, cy = TILE*ty + TILE*0.42;
+    g.strokeStyle = "#3e8a3a"; g.lineWidth = 1.6;
+    g.beginPath(); g.moveTo(cx, TILE*ty + TILE); g.lineTo(cx, cy); g.stroke();
+    g.fillStyle = "#3e8a3a";
+    g.beginPath(); g.ellipse(cx-4, cy+8, 4, 2, 0.6, 0, TAU); g.fill();
+    g.fillStyle = petal;
+    for (let a = 0; a < 6; a++) {
+      const an = a / 6 * TAU;
+      g.beginPath(); g.ellipse(cx + Math.cos(an)*5, cy + Math.sin(an)*5, 3.4, 2.2, an, 0, TAU); g.fill();
+    }
+    g.fillStyle = center;
+    g.beginPath(); g.arc(cx, cy, 2.6, 0, TAU); g.fill();
+  }
+  flower(T.FLOWER_R, "#e8556a", "#ffd23f");
+  flower(T.FLOWER_Y, "#ffd23f", "#e8893f");
+  flower(T.FLOWER_W, "#f4f4f8", "#ffd23f");
+  flower(T.FLOWER_B, "#6f8ff0", "#ffd23f");
+  // gravel
+  noiseTile(T.GRAVEL, [120, 116, 110], 60, false);
+  for (let i = 0; i < 40; i++) {
+    g.fillStyle = `rgba(${90+rng()*60|0},${86+rng()*60|0},${80+rng()*50|0},.8)`;
+    g.fillRect(rng()*TILE|0, TILE*T.GRAVEL + (rng()*TILE|0), 1 + (rng()*2|0), 1 + (rng()*2|0));
+  }
+  // mossy stone
+  noiseTile(T.MOSSY, [108, 116, 96], 40, false);
+  for (let i = 0; i < 70; i++) {
+    g.fillStyle = `rgba(${50+rng()*40|0},${100+rng()*60|0},${40+rng()*30|0},.6)`;
+    g.fillRect(rng()*TILE|0, TILE*T.MOSSY + (rng()*TILE|0), 1, 1);
+  }
+  // coal ore
+  noiseTile(T.COAL, [128, 128, 134], 44, true);
+  for (let i = 0; i < 22; i++) {
+    g.fillStyle = "rgba(24,24,28,.9)";
+    g.fillRect(6 + (rng()*20|0), TILE*T.COAL + 6 + (rng()*20|0), 2 + (rng()*3|0), 2 + (rng()*3|0));
+  }
+  // iron ore
+  noiseTile(T.IRON, [128, 124, 130], 44, true);
+  for (let i = 0; i < 20; i++) {
+    g.fillStyle = "rgba(196,150,96,.9)";
+    g.fillRect(6 + (rng()*20|0), TILE*T.IRON + 6 + (rng()*20|0), 2 + (rng()*2|0), 2 + (rng()*2|0));
+  }
+  // pine bark + needles
+  noiseTile(T.PINEBARK, [78, 56, 36], 30, false);
+  noiseTile(T.PINELEAF, [38, 86, 56], 60, false);
+  for (let i = 0; i < 80; i++) {
+    g.fillStyle = `rgba(${20+rng()*30|0},${70+rng()*50|0},${40+rng()*30|0},.8)`;
+    g.fillRect(rng()*TILE|0, TILE*T.PINELEAF + (rng()*TILE|0), 1, 1);
+  }
+  // mushroom (decoration)
+  g.clearRect(0, TILE*T.MUSHROOM, TILE, TILE);
+  (function(){
+    const cx = TILE/2, base = TILE*T.MUSHROOM + TILE;
+    g.strokeStyle = "#e9e3d4"; g.lineWidth = 3;
+    g.beginPath(); g.moveTo(cx, base); g.lineTo(cx, base - 12); g.stroke();
+    g.fillStyle = "#c0392b";
+    g.beginPath(); g.ellipse(cx, base - 13, 8, 6, 0, Math.PI, 0); g.fill();
+    g.fillStyle = "#fff";
+    g.beginPath(); g.arc(cx-3, base-15, 1.4, 0, TAU); g.fill();
+    g.beginPath(); g.arc(cx+3, base-14, 1.2, 0, TAU); g.fill();
+  })();
+  // dead bush (decoration)
+  g.clearRect(0, TILE*T.DEADBUSH, TILE, TILE);
+  (function(){
+    const cx = TILE/2, base = TILE*T.DEADBUSH + TILE;
+    g.strokeStyle = "#8a6a3a"; g.lineWidth = 1.4;
+    for (let i = 0; i < 6; i++) {
+      g.beginPath(); g.moveTo(cx, base);
+      g.lineTo(cx + (rng()-0.5)*18, base - 8 - rng()*16); g.stroke();
+    }
+  })();
+  // extra weathering pass: speckle and crack detail across several tiles
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < 60; i++) {
+      g.fillStyle = `rgba(0,0,0,${(0.04 + rng()*0.05).toFixed(3)})`;
+      g.fillRect(rng()*TILE|0, TILE*T.STONE + (rng()*TILE|0), 1, 1);
+      g.fillStyle = `rgba(255,255,255,${(0.05 + rng()*0.06).toFixed(3)})`;
+      g.fillRect(rng()*TILE|0, TILE*T.SNOW + (rng()*TILE|0), 1, 1);
+      g.fillStyle = `rgba(0,0,0,${(0.03 + rng()*0.04).toFixed(3)})`;
+      g.fillRect(rng()*TILE|0, TILE*T.SAND + (rng()*TILE|0), 1, 1);
+      g.fillStyle = `rgba(40,70,30,${(0.06 + rng()*0.08).toFixed(3)})`;
+      g.fillRect(rng()*TILE|0, TILE*T.GRASS_TOP + (rng()*TILE|0), 1, 1);
+      g.fillStyle = `rgba(60,40,24,${(0.05 + rng()*0.06).toFixed(3)})`;
+      g.fillRect(rng()*TILE|0, TILE*T.DIRT + (rng()*TILE|0), 1, 1);
+    }
+  }
+  return cv;
+}
+
+/* -------------------------------------------------------------------------------------
+   5. World generation — chunked voxel volume + decoration list
+   ------------------------------------------------------------------------------------- */
+const WORLD_X = 110, WORLD_Z = 110, WORLD_Y = 56;
+const SEA = 15;
+const idx = (x, y, z) => ((y * WORLD_Z) + z) * WORLD_X + x;
+const inB = (x, y, z) => x>=0 && x<WORLD_X && y>=0 && y<WORLD_Y && z>=0 && z<WORLD_Z;
+const voxels = new Uint8Array(WORLD_X * WORLD_Y * WORLD_Z);
+const getV = (x,y,z) => inB(x,y,z) ? voxels[idx(x,y,z)] : B.AIR;
+const setV = (x,y,z,v) => { if (inB(x,y,z)) voxels[idx(x,y,z)] = v; };
+
+const decorations = []; // {x,y,z,tile}
+let voxelCount = 0;
+
+function generateWorld() {
+  const rng = makeRng(20260614);
+  for (let x = 0; x < WORLD_X; x++) {
+    for (let z = 0; z < WORLD_Z; z++) {
+      // island falloff so the land sits in surrounding water
+      const cx = (x / WORLD_X - 0.5) * 2, cz = (z / WORLD_Z - 0.5) * 2;
+      const island = clamp(1.08 - (cx*cx + cz*cz) * 0.95, 0, 1);
+      const rolling = warpedFbm(x * 0.022, z * 0.022);
+      const mountains = ridge(x * 0.016 + 50, z * 0.016 + 50, 5);
+      let h = SEA - 3
+            + rolling * 20 * island
+            + mountains * 26 * Math.pow(island, 1.6);
+      h = clamp(Math.floor(h), 1, WORLD_Y - 4);
+
+      for (let y = 0; y <= h; y++) {
+        let block;
+        if (y === h) {
+          if (h <= SEA) block = (perlin2(x*0.2, z*0.2) > 0.6) ? B.GRAVEL : B.SAND;
+          else if (h > SEA + 22) block = B.SNOW;
+          else if (h > SEA + 15) block = (perlin2(x*0.1, z*0.1) > 0.5) ? B.STONE : B.GRASS;
+          else if (h === SEA + 1 && perlin2(x*0.3 + 9, z*0.3) > 0.55) block = B.MOSSY;
+          else block = B.GRASS;
+        } else if (y > h - 3) {
+          block = (h <= SEA + 1) ? B.SAND : B.DIRT;
+        } else {
+          const ore = fbm3(x*0.12, y*0.12, z*0.12, 3);
+          if (ore > 0.74) block = B.IRON;
+          else if (ore < 0.26) block = B.COAL;
+          else block = B.STONE;
+        }
+        setV(x, y, z, block); voxelCount++;
+      }
+    }
+  }
+  // carve caves with a 3D noise field, kept below the surface crust
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++) {
+      let surf = -1;
+      for (let y = WORLD_Y - 1; y >= 0; y--) { if (voxels[idx(x,y,z)] !== B.AIR){ surf = y; break; } }
+      for (let y = 2; y < surf - 3; y++) {
+        if (voxels[idx(x,y,z)] === B.AIR) continue;
+        const c = perlin3(x*0.09, y*0.13, z*0.09);
+        if (c > 0.78 && y > SEA - 6) { voxels[idx(x,y,z)] = B.AIR; voxelCount--; }
+      }
+    }
+  // trees + decorations on grass above the waterline
+  for (let x = 3; x < WORLD_X - 3; x++) {
+    for (let z = 3; z < WORLD_Z - 3; z++) {
+      let sy = -1;
+      for (let y = WORLD_Y - 1; y >= 0; y--) { if (getV(x,y,z) !== B.AIR){ sy=y; break; } }
+      if (sy < SEA + 1) continue;
+      const surface = getV(x, sy, z);
+      if (surface !== B.GRASS) continue;
+
+      const r = rng();
+      if (r < 0.020) {
+        const pine = sy > SEA + 16;
+        const wood = pine ? B.PINEWOOD : B.WOOD;
+        const leaf = pine ? B.PINELEAF : B.LEAF;
+        const th = (pine ? 6 : 4) + (rng() * 3 | 0);
+        for (let t = 1; t <= th; t++) { setV(x, sy + t, z, wood); voxelCount++; }
+        const top = sy + th;
+        if (pine) {
+          for (let layer = 0; layer < 4; layer++) {
+            const rr = 3 - layer, ly = top - 2 + layer;
+            for (let dx = -rr; dx <= rr; dx++)
+              for (let dz = -rr; dz <= rr; dz++) {
+                if (dx*dx + dz*dz > rr*rr + 1) continue;
+                if (getV(x+dx, ly, z+dz) === B.AIR) { setV(x+dx, ly, z+dz, leaf); voxelCount++; }
+              }
+          }
+          setV(x, top + 1, z, leaf); voxelCount++;
+        } else {
+          for (let dy = -1; dy <= 2; dy++) {
+            const rr = (dy === 2) ? 1 : 2;
+            for (let dx = -rr; dx <= rr; dx++)
+              for (let dz = -rr; dz <= rr; dz++) {
+                if (dx*dx + dz*dz > rr*rr + 1) continue;
+                if (getV(x+dx, top+dy, z+dz) === B.AIR) { setV(x+dx, top+dy, z+dz, leaf); voxelCount++; }
+              }
+          }
+        }
+      } else if (r < 0.17) {
+        let tile = T.BLADE;
+        const f = rng();
+        if (f > 0.95) tile = T.FLOWER_R;
+        else if (f > 0.90) tile = T.FLOWER_Y;
+        else if (f > 0.86) tile = T.MUSHROOM;
+        else if (f > 0.83) tile = T.DEADBUSH;
+        decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile });
+      }
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------------------
+   6. Meshers — opaque terrain (with AO), water surface, and cross-quad decorations
+   ------------------------------------------------------------------------------------- */
+const FACES = [
+  { n:[1,0,0], face:1, v:[[1,0,0],[1,0,1],[1,1,1],[1,1,0]],
+    ao:[ [[1,1,0],[1,0,-1],[1,1,-1]],[[1,1,0],[1,0,1],[1,1,1]],[[1,-1,0],[1,0,1],[1,-1,1]],[[1,-1,0],[1,0,-1],[1,-1,-1]] ] },
+  { n:[-1,0,0], face:1, v:[[0,0,1],[0,0,0],[0,1,0],[0,1,1]],
+    ao:[ [[-1,-1,0],[-1,0,1],[-1,-1,1]],[[-1,-1,0],[-1,0,-1],[-1,-1,-1]],[[-1,1,0],[-1,0,-1],[-1,1,-1]],[[-1,1,0],[-1,0,1],[-1,1,1]] ] },
+  { n:[0,1,0], face:0, v:[[0,1,1],[1,1,1],[1,1,0],[0,1,0]],
+    ao:[ [[0,1,1],[-1,1,0],[-1,1,1]],[[0,1,1],[1,1,0],[1,1,1]],[[0,1,-1],[1,1,0],[1,1,-1]],[[0,1,-1],[-1,1,0],[-1,1,-1]] ] },
+  { n:[0,-1,0], face:2, v:[[0,0,0],[1,0,0],[1,0,1],[0,0,1]],
+    ao:[ [[0,-1,-1],[-1,-1,0],[-1,-1,-1]],[[0,-1,-1],[1,-1,0],[1,-1,-1]],[[0,-1,1],[1,-1,0],[1,-1,1]],[[0,-1,1],[-1,-1,0],[-1,-1,1]] ] },
+  { n:[0,0,1], face:1, v:[[1,0,1],[0,0,1],[0,1,1],[1,1,1]],
+    ao:[ [[1,-1,1],[0,-1,1],[1,0,1]],[[-1,-1,1],[0,-1,1],[-1,0,1]],[[-1,1,1],[0,1,1],[-1,0,1]],[[1,1,1],[0,1,1],[1,0,1]] ] },
+  { n:[0,0,-1], face:1, v:[[0,0,0],[1,0,0],[1,1,0],[0,1,0]],
+    ao:[ [[-1,-1,-1],[0,-1,-1],[-1,0,-1]],[[1,-1,-1],[0,-1,-1],[1,0,-1]],[[1,1,-1],[0,1,-1],[1,0,-1]],[[-1,1,-1],[0,1,-1],[-1,0,-1]] ] }
+];
+const isSolid = (v) => v !== B.AIR && v !== B.WATER;
+const aoLevel = (s1, s2, c) => (s1 && s2) ? 0 : 3 - (s1 + s2 + c);
+
+function pushQuad(arr, verts, n, uv, ao) {
+  const order = (ao[0] + ao[2] > ao[1] + ao[3]) ? [0,1,2,2,3,0] : [1,2,3,3,0,1];
+  for (let i = 0; i < 6; i++) {
+    const k = order[i];
+    arr.push(verts[k][0], verts[k][1], verts[k][2],
+             uv[k][0], uv[k][1], n[0], n[1], n[2], ao[k] / 3);
+  }
+}
+
+function buildMeshes() {
+  const opaque = [], water = [];
+  let triCount = 0;
+  for (let x = 0; x < WORLD_X; x++)
+    for (let y = 0; y < WORLD_Y; y++)
+      for (let z = 0; z < WORLD_Z; z++) {
+        const v = getV(x, y, z);
+        if (v === B.AIR) continue;
+        if (v === B.WATER) {
+          if (getV(x, y + 1, z) === B.AIR) {
+            const yy = y + 0.88;
+            const shore = (isSolid(getV(x+1,y,z)) || isSolid(getV(x-1,y,z)) ||
+                           isSolid(getV(x,y,z+1)) || isSolid(getV(x,y,z-1))) ? 3 : 0;
+            pushQuad(water, [[x,yy,z+1],[x+1,yy,z+1],[x+1,yy,z],[x,yy,z]],
+                     [0,1,0], [[0,0],[1,0],[1,1],[0,1]], [shore,shore,shore,shore]);
+            triCount += 2;
+          }
+          continue;
+        }
+        const tiles = FACE_TILES[v];
+        for (let f = 0; f < 6; f++) {
+          const F = FACES[f];
+          const neighbor = getV(x+F.n[0], y+F.n[1], z+F.n[2]);
+          if (isSolid(neighbor)) continue;
+          if (v === B.LEAF && neighbor === B.LEAF) continue;
+          const tile = tiles[F.face];
+          const verts = [], aos = [];
+          for (let c = 0; c < 4; c++) {
+            const off = F.v[c];
+            verts.push([x+off[0], y+off[1], z+off[2]]);
+            const a = F.ao[c];
+            const s1 = isSolid(getV(x+a[0][0],y+a[0][1],z+a[0][2])) ? 1 : 0;
+            const s2 = isSolid(getV(x+a[1][0],y+a[1][1],z+a[1][2])) ? 1 : 0;
+            const cn = isSolid(getV(x+a[2][0],y+a[2][1],z+a[2][2])) ? 1 : 0;
+            aos.push(aoLevel(s1, s2, cn));
+          }
+          const v0 = tile / TILE_COUNT, v1 = (tile + 1) / TILE_COUNT;
+          pushQuad(opaque, verts, F.n, [[0,v1],[1,v1],[1,v0],[0,v0]], aos);
+          triCount += 2;
+        }
+      }
+  return { opaque: new Float32Array(opaque), water: new Float32Array(water), triCount };
+}
+
+// decorations: two crossed vertical quads per plant. layout: pos(3), uv(2) = 5 floats
+function buildDecoMesh() {
+  const arr = [];
+  const s = 0.45;
+  for (const d of decorations) {
+    const v0 = d.tile / TILE_COUNT, v1 = (d.tile + 1) / TILE_COUNT;
+    const cx = d.x, cy = d.y, cz = d.z;
+    const quads = [
+      [[cx-s,cy,cz-s],[cx+s,cy,cz+s]],
+      [[cx-s,cy,cz+s],[cx+s,cy,cz-s]]
+    ];
+    for (const q of quads) {
+      const [a, b] = q;
+      const top = 1.0;
+      const p = [
+        [a[0],cy,a[2]], [b[0],cy,b[2]], [b[0],cy+top,b[2]], [a[0],cy+top,a[2]]
+      ];
+      const uv = [[0,v1],[1,v1],[1,v0],[0,v0]];
+      const tri = [0,1,2,2,3,0];
+      for (const k of tri) arr.push(p[k][0],p[k][1],p[k][2], uv[k][0],uv[k][1]);
+    }
+  }
+  return new Float32Array(arr);
+}
+
+/* -------------------------------------------------------------------------------------
+   7. WebGL setup + shader compilation
+   ------------------------------------------------------------------------------------- */
+const canvas = $("gl");
+const gl = canvas.getContext("webgl2", { antialias: true, alpha: false, powerPreference: "high-performance" });
+if (!gl) fatal("WebGL2 is not available in this browser.");
+
+function compile(type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS))
+    fatal("Shader compile error:\n" + gl.getShaderInfoLog(sh) + "\n\n" +
+          src.split("\n").map((l,i)=>(i+1)+": "+l).join("\n"));
+  return sh;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    fatal("Program link error:\n" + gl.getProgramInfoLog(p));
+  return p;
+}
+const U = (p, names) => { const o={}; names.forEach(n=>o[n]=gl.getUniformLocation(p,n)); return o; };
+
+/* ---------- depth-only pass (shadow map) ---------- */
+const VS_DEPTH = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+uniform mat4 uLightVP;
+void main(){ gl_Position = uLightVP * vec4(aPos, 1.0); }`;
+const FS_DEPTH = `#version 300 es
+precision highp float;
+out vec4 frag;
+void main(){ frag = vec4(1.0); }`;
+
+/* ---------- terrain ---------- */
+const VS_TERRAIN = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec2 aUV;
+layout(location=2) in vec3 aNormal;
+layout(location=3) in float aAO;
+uniform mat4 uVP, uLightVP;
+out vec2 vUV; out vec3 vNormal; out float vAO; out vec3 vWorld; out vec4 vLightPos;
+void main(){
+  vUV = aUV; vNormal = aNormal; vAO = aAO; vWorld = aPos;
+  vLightPos = uLightVP * vec4(aPos, 1.0);
+  gl_Position = uVP * vec4(aPos, 1.0);
+}`;
+const FS_TERRAIN = `#version 300 es
+precision highp float;
+in vec2 vUV; in vec3 vNormal; in float vAO; in vec3 vWorld; in vec4 vLightPos;
+uniform sampler2D uTex; uniform sampler2D uShadow;
+uniform vec3 uSunDir, uSunColor, uAmbient, uFogColor, uCamPos;
+uniform float uFogDensity, uShadowOn;
+out vec4 frag;
+float shadow(vec3 N){
+  vec3 p = vLightPos.xyz / vLightPos.w; p = p * 0.5 + 0.5;
+  if (p.z > 1.0 || p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
+  float bias = max(0.0035 * (1.0 - dot(N, uSunDir)), 0.0010);
+  float sh = 0.0; vec2 tx = vec2(1.0 / 2048.0);
+  for (int x = -1; x <= 1; x++)
+    for (int y = -1; y <= 1; y++) {
+      float d = texture(uShadow, p.xy + vec2(float(x), float(y)) * tx).r;
+      sh += (p.z - bias > d) ? 0.0 : 1.0;
+    }
+  sh /= 9.0;
+  return mix(0.55, 1.0, sh); // clamp so shadows deepen but never go pure black
+}
+void main(){
+  vec4 tex = texture(uTex, vUV);
+  vec3 N = normalize(vNormal);
+  float diff = max(dot(N, uSunDir), 0.0);
+  float wrap = max(dot(N, uSunDir) * 0.5 + 0.5, 0.0);
+  float ao = mix(0.42, 1.0, vAO);
+  float sh = mix(1.0, shadow(N), uShadowOn);
+  vec3 light = uAmbient * ao + uSunColor * (diff * 0.85 + wrap * 0.15) * ao * sh;
+  vec3 color = tex.rgb * light;
+  float dist = length(vWorld - uCamPos);
+  float fog = 1.0 - exp(-uFogDensity * dist);
+  color = mix(color, uFogColor, clamp(fog, 0.0, 1.0));
+  frag = vec4(color, 1.0);
+}`;
+
+/* ---------- decorations (alpha cut) ---------- */
+const VS_DECO = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec2 aUV;
+uniform mat4 uVP;
+out vec2 vUV; out vec3 vWorld;
+void main(){ vUV = aUV; vWorld = aPos; gl_Position = uVP * vec4(aPos, 1.0); }`;
+const FS_DECO = `#version 300 es
+precision highp float;
+in vec2 vUV; in vec3 vWorld;
+uniform sampler2D uTex;
+uniform vec3 uSunColor, uAmbient, uFogColor, uCamPos;
+uniform float uFogDensity;
+out vec4 frag;
+void main(){
+  vec4 tex = texture(uTex, vUV);
+  if (tex.a < 0.5) discard;
+  vec3 light = uAmbient + uSunColor * 0.7;
+  vec3 color = tex.rgb * light;
+  float dist = length(vWorld - uCamPos);
+  float fog = 1.0 - exp(-uFogDensity * dist);
+  color = mix(color, uFogColor, clamp(fog, 0.0, 1.0));
+  frag = vec4(color, 1.0);
+}`;
+
+/* ---------- water ---------- */
+const VS_WATER = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=3) in float aFoam;
+uniform mat4 uVP; uniform float uTime;
+out vec3 vWorld; out vec3 vNormal; out float vFoam;
+void main(){
+  vec3 p = aPos;
+  float w = sin(p.x * 0.7 + uTime * 1.6) * 0.06 + cos(p.z * 0.9 + uTime * 1.2) * 0.05;
+  p.y += w;
+  float dx = cos(p.x * 0.7 + uTime * 1.6) * 0.7 * 0.06;
+  float dz = -sin(p.z * 0.9 + uTime * 1.2) * 0.9 * 0.05;
+  vNormal = normalize(vec3(-dx, 1.0, -dz));
+  vWorld = p; vFoam = aFoam;
+  gl_Position = uVP * vec4(p, 1.0);
+}`;
+const FS_WATER = `#version 300 es
+precision highp float;
+in vec3 vWorld; in vec3 vNormal; in float vFoam;
+uniform vec3 uSunDir, uSunColor, uCamPos, uFogColor;
+uniform float uFogDensity, uTime;
+out vec4 frag;
+void main(){
+  vec3 N = normalize(vNormal);
+  vec3 V = normalize(uCamPos - vWorld);
+  vec3 R = reflect(-uSunDir, N);
+  float spec = pow(max(dot(R, V), 0.0), 48.0);
+  float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+  vec3 col = mix(vec3(0.04,0.20,0.36), vec3(0.20,0.46,0.62), fres);
+  col += uSunColor * spec * 0.9;
+  float dist = length(vWorld - uCamPos);
+  float fog = 1.0 - exp(-uFogDensity * dist);
+  float foam = clamp(vFoam * (0.45 + 0.55 * sin(uTime * 3.0 + (vWorld.x + vWorld.z) * 1.5)), 0.0, 1.0);
+  col = mix(col, vec3(0.9, 0.95, 0.98), foam * 0.7);
+  col = mix(col, uFogColor, clamp(fog, 0.0, 1.0));
+  frag = vec4(col, mix(0.80, 0.95, foam));
+}`;
+
+/* ---------- sky (fullscreen, with stars + sun + moon + clouds) ---------- */
+const VS_SKY = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aPos;
+out vec2 vNdc;
+void main(){ vNdc = aPos; gl_Position = vec4(aPos, 0.9999, 1.0); }`;
+const FS_SKY = `#version 300 es
+precision highp float;
+in vec2 vNdc;
+uniform mat4 uInvVP; uniform vec3 uSunDir, uTop, uBottom, uSunColor;
+uniform float uTime, uNight;
+out vec4 frag;
+float hash(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+34.5); return fract(p.x*p.y); }
+float noise(vec2 p){ vec2 i=floor(p),f=fract(p);
+  float a=hash(i),b=hash(i+vec2(1,0)),c=hash(i+vec2(0,1)),d=hash(i+vec2(1,1));
+  vec2 u=f*f*(3.0-2.0*f); return mix(mix(a,b,u.x),mix(c,d,u.x),u.y); }
+float fbmS(vec2 p){ float s=0.0,a=0.5; for(int i=0;i<5;i++){ s+=a*noise(p); p*=2.02; a*=0.5; } return s; }
+void main(){
+  vec4 nr = uInvVP * vec4(vNdc, -1.0, 1.0);
+  vec4 fr = uInvVP * vec4(vNdc,  1.0, 1.0);
+  vec3 dir = normalize(fr.xyz/fr.w - nr.xyz/nr.w);
+  float h = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+  vec3 sky = mix(uBottom, uTop, pow(h, 0.8));
+  // stars at night
+  if (uNight > 0.01 && dir.y > 0.0) {
+    vec2 sc = dir.xz / (dir.y + 0.25) * 12.0;
+    float st = hash(floor(sc));
+    float tw = step(0.985, st) * (0.6 + 0.4 * sin(uTime * 3.0 + st * 50.0));
+    sky += vec3(tw) * uNight;
+  }
+  // sun glow + disc
+  float sd = max(dot(dir, uSunDir), 0.0);
+  sky += uSunColor * pow(sd, 280.0) * 7.0;
+  sky += uSunColor * pow(sd, 8.0) * 0.22;
+  // moon, opposite the sun, visible at night
+  float md = max(dot(dir, -uSunDir), 0.0);
+  sky += vec3(0.85,0.88,0.95) * pow(md, 600.0) * 5.0 * uNight;
+  // drifting clouds projected onto a dome
+  if (dir.y > 0.02) {
+    vec2 uv = dir.xz / (dir.y + 0.15);
+    float c = fbmS(uv * 1.6 + vec2(uTime*0.01, uTime*0.006));
+    c = smoothstep(0.55, 0.95, c) * smoothstep(0.0, 0.25, dir.y);
+    vec3 cc = mix(uTop*1.1, uSunColor*1.2 + vec3(0.3), 0.4) * (1.0 - 0.6*uNight);
+    sky = mix(sky, cc, c * 0.6);
+  }
+  frag = vec4(sky, 1.0);
+}`;
+
+/* ---------- particles (birds + pollen), positions computed in the vertex shader ---------- */
+const VS_PART = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aSeed;   // random seed per particle
+uniform mat4 uVP; uniform float uTime, uMode; uniform vec3 uCenter;
+out float vFade;
+void main(){
+  vec3 pos;
+  float sz;
+  if (uMode < 0.5) {
+    // birds: wheel on large circles with vertical bob
+    float r = 30.0 + aSeed.x * 40.0;
+    float spd = 0.12 + aSeed.y * 0.12;
+    float ang = uTime * spd + aSeed.z * 6.28;
+    pos = uCenter + vec3(cos(ang) * r, 26.0 + aSeed.z * 16.0 + sin(uTime*0.8 + aSeed.x*9.0)*2.5, sin(ang) * r);
+    sz = 3.0;
+    vFade = 1.0;
+  } else {
+    // pollen: drift inside a box around the centre, wrapping slowly
+    vec3 d = vec3(
+      fract(aSeed.x + uTime * 0.01) - 0.5,
+      fract(aSeed.y + uTime * 0.006) - 0.5,
+      fract(aSeed.z + uTime * 0.008) - 0.5);
+    pos = uCenter + d * vec3(120.0, 40.0, 120.0) + vec3(0.0, 14.0, 0.0);
+    sz = 2.0 + 2.0 * fract(aSeed.x * 7.0);
+    vFade = 0.4 + 0.6 * abs(sin(uTime * 1.5 + aSeed.z * 10.0));
+  }
+  vec4 clip = uVP * vec4(pos, 1.0);
+  gl_Position = clip;
+  gl_PointSize = sz * (300.0 / max(clip.w, 1.0));
+}`;
+const FS_PART = `#version 300 es
+precision highp float;
+in float vFade; uniform float uMode; uniform vec3 uSunColor;
+out vec4 frag;
+void main(){
+  vec2 q = gl_PointCoord - 0.5;
+  float d = dot(q, q);
+  if (d > 0.25) discard;
+  if (uMode < 0.5) {
+    frag = vec4(vec3(0.05,0.06,0.09), 1.0);          // dark bird silhouettes
+  } else {
+    float a = (1.0 - d * 4.0) * vFade * 0.7;
+    frag = vec4(uSunColor * 1.2 + vec3(0.2), a);     // glowing pollen motes
+  }
+}`;
+
+/* ---------- fauna & weather sprites (CPU-simulated points: boids, butterflies, fireflies, precip) ---------- */
+const VS_SPRITE = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aCol;
+layout(location=2) in vec2 aSA;   // x=size, y=alpha
+uniform mat4 uVP;
+out vec3 vCol; out float vAlpha;
+void main(){
+  vCol = aCol; vAlpha = aSA.y;
+  vec4 clip = uVP * vec4(aPos, 1.0);
+  gl_Position = clip;
+  gl_PointSize = aSA.x * (300.0 / max(clip.w, 1.0));
+}`;
+const FS_SPRITE = `#version 300 es
+precision highp float;
+in vec3 vCol; in float vAlpha; out vec4 frag;
+void main(){
+  vec2 q = gl_PointCoord - 0.5;
+  float d = dot(q, q);
+  if (d > 0.25) discard;
+  float a = vAlpha * (1.0 - d * 3.0);
+  frag = vec4(vCol, clamp(a, 0.0, 1.0));
+}`;
+
+/* ---------- post processing: ACES tonemap + vignette + saturation + gamma ---------- */
+const VS_POST = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 aPos;
+out vec2 vUv;
+void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+const FS_POST = `#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uScene; uniform sampler2D uBloom; uniform vec2 uTexel;
+uniform vec2 uSunScreen; uniform float uSunVis;
+out vec4 frag;
+vec3 aces(vec3 x){
+  float a=2.51,b=0.03,c=2.43,d=0.59,e=0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e), 0.0, 1.0);
+}
+vec3 fxaa(vec2 uv){
+  vec3 luma = vec3(0.299, 0.587, 0.114);
+  float nw = dot(texture(uScene, uv + vec2(-1.0,-1.0)*uTexel).rgb, luma);
+  float ne = dot(texture(uScene, uv + vec2( 1.0,-1.0)*uTexel).rgb, luma);
+  float sw = dot(texture(uScene, uv + vec2(-1.0, 1.0)*uTexel).rgb, luma);
+  float se = dot(texture(uScene, uv + vec2( 1.0, 1.0)*uTexel).rgb, luma);
+  vec3 mc = texture(uScene, uv).rgb;
+  float m = dot(mc, luma);
+  float lmin = min(m, min(min(nw, ne), min(sw, se)));
+  float lmax = max(m, max(max(nw, ne), max(sw, se)));
+  vec2 dir = vec2(-((nw + ne) - (sw + se)), ((nw + sw) - (ne + se)));
+  float reduce = max((nw + ne + sw + se) * 0.03125, 0.0078125);
+  float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+  dir = clamp(dir * rcp, -8.0, 8.0) * uTexel;
+  vec3 rA = 0.5 * (texture(uScene, uv + dir * (1.0/3.0 - 0.5)).rgb +
+                   texture(uScene, uv + dir * (2.0/3.0 - 0.5)).rgb);
+  vec3 rB = rA * 0.5 + 0.25 * (texture(uScene, uv + dir * -0.5).rgb +
+                               texture(uScene, uv + dir * 0.5).rgb);
+  float lB = dot(rB, luma);
+  return (lB < lmin || lB > lmax) ? rA : rB;
+}
+void main(){
+  vec3 col = fxaa(vUv);
+  col += texture(uBloom, vUv).rgb * 0.65;
+  if (uSunVis > 0.0) {
+    vec2 rd = (uSunScreen - vUv) / 24.0;
+    vec2 uv = vUv; float decay = 1.0; vec3 shaft = vec3(0.0);
+    for (int i = 0; i < 24; i++) {
+      uv += rd;
+      vec3 sc = texture(uScene, uv).rgb;
+      float br = max(sc.r, max(sc.g, sc.b));
+      shaft += sc * smoothstep(0.7, 1.0, br) * decay;
+      decay *= 0.92;
+    }
+    col += shaft * (0.05 * uSunVis);
+  }
+  col = aces(col * 1.06);
+  float l = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(l), col, 1.12);
+  vec2 q = vUv - 0.5;
+  col *= mix(0.78, 1.0, smoothstep(0.95, 0.32, length(q)));
+  col = pow(col, vec3(1.0/2.2));
+  frag = vec4(col, 1.0);
+}`;
+const FS_BRIGHT = `#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uScene; out vec4 frag;
+void main(){
+  vec3 c = texture(uScene, vUv).rgb;
+  float l = dot(c, vec3(0.299, 0.587, 0.114));
+  float k = smoothstep(0.62, 1.0, l);
+  frag = vec4(c * k, 1.0);
+}`;
+const FS_BLUR = `#version 300 es
+precision highp float;
+in vec2 vUv; uniform sampler2D uTex; uniform vec2 uDir; out vec4 frag;
+void main(){
+  vec3 sum = texture(uTex, vUv).rgb * 0.227027;
+  vec2 o1 = uDir * 1.3846153846, o2 = uDir * 3.2307692308;
+  sum += texture(uTex, vUv + o1).rgb * 0.3162162162;
+  sum += texture(uTex, vUv - o1).rgb * 0.3162162162;
+  sum += texture(uTex, vUv + o2).rgb * 0.0702702703;
+  sum += texture(uTex, vUv - o2).rgb * 0.0702702703;
+  frag = vec4(sum, 1.0);
+}`;
+
+const progDepth   = program(VS_DEPTH, FS_DEPTH);
+const progTerrain = program(VS_TERRAIN, FS_TERRAIN);
+const progDeco    = program(VS_DECO, FS_DECO);
+const progWater   = program(VS_WATER, FS_WATER);
+const progSky     = program(VS_SKY, FS_SKY);
+const progPart    = program(VS_PART, FS_PART);
+const progPost    = program(VS_POST, FS_POST);
+const progBright  = program(VS_POST, FS_BRIGHT);
+const progBlur    = program(VS_POST, FS_BLUR);
+
+const uD = U(progDepth, ["uLightVP"]);
+const uT = U(progTerrain, ["uVP","uLightVP","uTex","uShadow","uSunDir","uSunColor","uAmbient","uFogColor","uCamPos","uFogDensity","uShadowOn"]);
+const uDe= U(progDeco, ["uVP","uTex","uSunColor","uAmbient","uFogColor","uCamPos","uFogDensity"]);
+const uW = U(progWater, ["uVP","uTime","uSunDir","uSunColor","uCamPos","uFogColor","uFogDensity"]);
+const uS = U(progSky, ["uInvVP","uSunDir","uTop","uBottom","uSunColor","uTime","uNight"]);
+const uP = U(progPart, ["uVP","uTime","uMode","uCenter","uSunColor"]);
+const uPo= U(progPost, ["uScene","uBloom","uTexel","uSunScreen","uSunVis"]);
+const uBr= U(progBright, ["uScene"]);
+const uBl= U(progBlur, ["uTex","uDir"]);
+const progSprite = program(VS_SPRITE, FS_SPRITE);
+const uSp = U(progSprite, ["uVP"]);
+
+/* -------------------------------------------------------------------------------------
+   8. Build world + GPU resources
+   ------------------------------------------------------------------------------------- */
+generateWorld();
+enrichWorld();
+const meshes = buildMeshes();
+const decoData = buildDecoMesh();
+
+// world enrichment: flood water, scatter boulders / ruins, shoreline reeds, meadows, kelp
+function enrichWorld() {
+  const rng = makeRng(0x5eed42);
+  const surf = (x, z) => { for (let y = WORLD_Y - 1; y >= 0; y--) if (getV(x, y, z) !== B.AIR) return y; return -1; };
+  // 0. carve winding rivers, then recolour the surface into temperature/moisture biomes
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++) {
+      const riv = Math.abs(perlin2(x * 0.018 + 7, z * 0.018 + 7) - 0.5);
+      const sy = surf(x, z);
+      if (sy > SEA && riv < 0.018) {
+        for (let y = SEA - 1; y <= sy; y++)
+          if (getV(x, y, z) !== B.AIR) { setV(x, y, z, B.AIR); voxelCount--; }
+        setV(x, SEA - 2, z, B.SAND);
+      }
+    }
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++) {
+      const sy = surf(x, z);
+      if (sy <= SEA || getV(x, sy, z) !== B.GRASS) continue;
+      const temp = perlin2(x * 0.012 + 100, z * 0.012);
+      const moist = perlin2(x * 0.012, z * 0.012 + 100);
+      if (temp > 0.62 && moist < 0.42) setV(x, sy, z, B.SAND);
+      else if (temp < 0.34) setV(x, sy, z, B.SNOW);
+      else if (moist > 0.68 && sy < SEA + 6) setV(x, sy, z, B.MOSSY);
+    }
+  // 1. flood low-lying air up to sea level
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++)
+      for (let y = 0; y <= SEA; y++)
+        if (getV(x, y, z) === B.AIR) { setV(x, y, z, B.WATER); voxelCount++; }
+  // 2. scatter mossy / stone boulders on land
+  for (let n = 0; n < 70; n++) {
+    const x = 4 + (rng() * (WORLD_X - 8) | 0), z = 4 + (rng() * (WORLD_Z - 8) | 0);
+    const sy = surf(x, z);
+    if (sy < SEA + 1 || getV(x, sy, z) === B.WATER) continue;
+    const r = 1 + (rng() * 2 | 0), moss = rng() > 0.5;
+    for (let dx = -r; dx <= r; dx++)
+      for (let dy = -r; dy <= r; dy++)
+        for (let dz = -r; dz <= r; dz++) {
+          if (dx*dx + dy*dy + dz*dz > r*r + 1) continue;
+          const yy = sy + dy + 1;
+          if (getV(x+dx, yy, z+dz) === B.AIR) { setV(x+dx, yy, z+dz, moss ? B.MOSSY : B.STONE); voxelCount++; }
+        }
+  }
+  // 3. ruined stone pillars as landmarks
+  for (let n = 0; n < 5; n++) {
+    const x = 10 + (rng() * (WORLD_X - 20) | 0), z = 10 + (rng() * (WORLD_Z - 20) | 0);
+    const sy = surf(x, z);
+    if (sy < SEA + 2 || getV(x, sy, z) === B.WATER) continue;
+    const ph = 4 + (rng() * 5 | 0);
+    for (let t = 1; t <= ph; t++) { setV(x, sy + t, z, B.MOSSY); voxelCount++; }
+    if (rng() > 0.5) { setV(x + 1, sy + ph, z, B.STONE); setV(x - 1, sy + ph, z, B.STONE); voxelCount += 2; }
+  }
+  // 4. shoreline reeds, beach bushes, inland meadows, shallow-water kelp
+  for (let x = 2; x < WORLD_X - 2; x++)
+    for (let z = 2; z < WORLD_Z - 2; z++) {
+      const sy = surf(x, z);
+      if (sy < 0) continue;
+      const top = getV(x, sy, z);
+      if (top === B.WATER) {
+        if (sy <= SEA && sy >= SEA - 4 && rng() < 0.05)
+          decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile: T.BLADE });
+        continue;
+      }
+      const nearWater = getV(x+1,sy,z)===B.WATER || getV(x-1,sy,z)===B.WATER ||
+                        getV(x,sy,z+1)===B.WATER || getV(x,sy,z-1)===B.WATER;
+      if (top === B.SAND && nearWater && rng() < 0.30)
+        decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile: T.BLADE });
+      else if (top === B.SAND && rng() < 0.03)
+        decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile: T.DEADBUSH });
+      else if (top === B.GRASS) {
+        const meadow = perlin2(x * 0.05 + 30, z * 0.05 + 30);
+        if (meadow > 0.60 && rng() < 0.20)
+          decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile: [T.FLOWER_R, T.FLOWER_Y, T.FLOWER_W, T.FLOWER_B][rng()*4|0] });
+      }
+    }
+  // 5. expose gravel on steep cliff faces
+  for (let x = 1; x < WORLD_X - 1; x++)
+    for (let z = 1; z < WORLD_Z - 1; z++) {
+      const sy = surf(x, z);
+      if (sy <= SEA) continue;
+      const top = getV(x, sy, z);
+      if (top !== B.GRASS && top !== B.STONE && top !== B.SNOW) continue;
+      const slope = Math.max(
+        Math.abs(sy - surf(x+1, z)), Math.abs(sy - surf(x-1, z)),
+        Math.abs(sy - surf(x, z+1)), Math.abs(sy - surf(x, z-1)));
+      if (slope >= 4) setV(x, sy, z, B.GRAVEL);
+    }
+  // 6. desert cacti on warm sand, thicker snow on cold peaks
+  for (let x = 1; x < WORLD_X - 1; x++)
+    for (let z = 1; z < WORLD_Z - 1; z++) {
+      const sy = surf(x, z);
+      if (sy <= SEA) continue;
+      const top = getV(x, sy, z);
+      if (top === B.SAND && sy > SEA + 2 && rng() < 0.012) {
+        const ch = 2 + (rng() * 2 | 0);
+        for (let t = 1; t <= ch; t++) { setV(x, sy + t, z, B.MOSSY); voxelCount++; }
+        if (rng() > 0.5 && getV(x + 1, sy + ch, z) === B.AIR) { setV(x + 1, sy + ch, z, B.MOSSY); voxelCount++; }
+      } else if (top === B.SNOW && rng() < 0.4) {
+        setV(x, sy + 1, z, B.SNOW); voxelCount++;
+      }
+    }
+  // 7. bushes and fallen logs scattered on grassland
+  for (let n = 0; n < 90; n++) {
+    const x = 3 + (rng() * (WORLD_X - 6) | 0), z = 3 + (rng() * (WORLD_Z - 6) | 0);
+    const sy = surf(x, z);
+    if (sy <= SEA || getV(x, sy, z) !== B.GRASS) continue;
+    if (rng() < 0.6) {
+      for (let dx = -1; dx <= 1; dx++)
+        for (let dz = -1; dz <= 1; dz++) {
+          if (Math.abs(dx) + Math.abs(dz) > 1) continue;
+          if (getV(x+dx, sy+1, z+dz) === B.AIR) { setV(x+dx, sy+1, z+dz, B.LEAF); voxelCount++; }
+        }
+      if (getV(x, sy+2, z) === B.AIR) { setV(x, sy+2, z, B.LEAF); voxelCount++; }
+    } else {
+      const len = 2 + (rng() * 3 | 0), dir = rng() > 0.5;
+      for (let t = 0; t < len; t++) {
+        const lx = x + (dir ? t : 0), lz = z + (dir ? 0 : t);
+        if (getV(lx, sy + 1, lz) === B.AIR) { setV(lx, sy + 1, lz, B.WOOD); voxelCount++; }
+      }
+    }
+  }
+  // 8. a ruined enclosure of low mossy walls on a flat clearing
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const ox = 12 + (rng() * (WORLD_X - 24) | 0), oz = 12 + (rng() * (WORLD_Z - 24) | 0);
+    const w = 5 + (rng() * 4 | 0), d = 5 + (rng() * 4 | 0);
+    const base = surf(ox, oz);
+    if (base <= SEA + 2) continue;
+    let flat = true;
+    for (let dx = 0; dx <= w && flat; dx++)
+      for (let dz = 0; dz <= d; dz++)
+        if (Math.abs(surf(ox + dx, oz + dz) - base) > 2) { flat = false; break; }
+    if (!flat) continue;
+    const wallH = 2 + (rng() * 2 | 0);
+    for (let dx = 0; dx <= w; dx++)
+      for (let dz = 0; dz <= d; dz++) {
+        if (!(dx === 0 || dz === 0 || dx === w || dz === d)) continue;
+        const h2 = rng() < 0.25 ? 0 : wallH - (rng() * 2 | 0);
+        for (let t = 1; t <= h2; t++) { setV(ox + dx, base + t, oz + dz, B.MOSSY); voxelCount++; }
+      }
+    break;
+  }
+  // 9. stepping stones across shallow river crossings
+  for (let n = 0; n < 60; n++) {
+    const x = 2 + (rng() * (WORLD_X - 4) | 0), z = 2 + (rng() * (WORLD_Z - 4) | 0);
+    const sy = surf(x, z);
+    if (getV(x, sy, z) !== B.WATER || sy > SEA) continue;
+    if (rng() < 0.15) { setV(x, sy, z, B.STONE); voxelCount++; }
+  }
+  // 10. small inland lakes carved into shallow basins, then flooded
+  for (let n = 0; n < 18; n++) {
+    const ox = 14 + (rng() * (WORLD_X - 28) | 0), oz = 14 + (rng() * (WORLD_Z - 28) | 0);
+    const base = surf(ox, oz);
+    if (base <= SEA + 1 || base > SEA + 10) continue;
+    const lr = 3 + (rng() * 4 | 0), depth = 2 + (rng() * 2 | 0), level = base - 1;
+    for (let dx = -lr; dx <= lr; dx++)
+      for (let dz = -lr; dz <= lr; dz++) {
+        const r2 = dx*dx + dz*dz;
+        if (r2 > lr*lr) continue;
+        const lx = ox + dx, lz = oz + dz, sy = surf(lx, lz);
+        for (let y = level; y <= sy; y++)
+          if (getV(lx, y, lz) !== B.AIR) { setV(lx, y, lz, B.AIR); voxelCount--; }
+        for (let y = level - depth; y <= level; y++)
+          if (getV(lx, y, lz) === B.AIR) { setV(lx, y, lz, B.WATER); voxelCount++; }
+        if (r2 > (lr-1)*(lr-1)) setV(lx, level - depth, lz, B.SAND);
+      }
+  }
+  // 11. dense groves: clusters of extra trees around random seed points
+  for (let gg = 0; gg < 8; gg++) {
+    const gx = 8 + (rng() * (WORLD_X - 16) | 0), gz = 8 + (rng() * (WORLD_Z - 16) | 0);
+    const groveR = 6 + (rng() * 5 | 0);
+    for (let k = 0; k < 14; k++) {
+      const x = clamp(gx + (((rng()-0.5) * groveR * 2) | 0), 2, WORLD_X - 3);
+      const z = clamp(gz + (((rng()-0.5) * groveR * 2) | 0), 2, WORLD_Z - 3);
+      const sy = surf(x, z);
+      if (sy <= SEA || getV(x, sy, z) !== B.GRASS) continue;
+      const th = 4 + (rng() * 3 | 0);
+      for (let t = 1; t <= th; t++) { setV(x, sy + t, z, B.WOOD); voxelCount++; }
+      const top = sy + th;
+      for (let dy = -1; dy <= 2; dy++) {
+        const rr = (dy === 2) ? 1 : 2;
+        for (let dx = -rr; dx <= rr; dx++)
+          for (let dz = -rr; dz <= rr; dz++) {
+            if (dx*dx + dz*dz > rr*rr + 1) continue;
+            if (getV(x+dx, top+dy, z+dz) === B.AIR) { setV(x+dx, top+dy, z+dz, B.LEAF); voxelCount++; }
+          }
+      }
+    }
+  }
+  // 12. light snow dusting on high, exposed grass near the snow line
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++) {
+      const sy = surf(x, z);
+      if (sy < SEA + 17 || sy > SEA + 22) continue;
+      if (getV(x, sy, z) === B.GRASS && perlin2(x*0.15 + 5, z*0.15) > 0.55) setV(x, sy, z, B.SNOW);
+    }
+  // 13. moss creeps onto stone next to water, and pebbles dot the beaches
+  for (let x = 1; x < WORLD_X - 1; x++)
+    for (let z = 1; z < WORLD_Z - 1; z++) {
+      const sy = surf(x, z);
+      if (sy < 0) continue;
+      const top = getV(x, sy, z);
+      if (top === B.STONE) {
+        const wet = getV(x+1,sy,z)===B.WATER || getV(x-1,sy,z)===B.WATER ||
+                    getV(x,sy,z+1)===B.WATER || getV(x,sy,z-1)===B.WATER;
+        if (wet || perlin2(x*0.2 + 12, z*0.2) > 0.66) setV(x, sy, z, B.MOSSY);
+      } else if (top === B.SAND && rng() < 0.04) {
+        setV(x, sy, z, B.GRAVEL);
+      }
+    }
+  // 14. occasional snowy boulder caps high up
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++) {
+      const sy = surf(x, z);
+      if (sy > SEA + 24 && getV(x, sy, z) === B.STONE && rng() < 0.5) setV(x, sy, z, B.SNOW);
+    }
+  // 15. dense flower-and-grass clusters seeded around a few bloom points
+  for (let c = 0; c < 14; c++) {
+    const bx = 6 + (rng() * (WORLD_X - 12) | 0), bz = 6 + (rng() * (WORLD_Z - 12) | 0);
+    const cr = 3 + (rng() * 4 | 0);
+    const palette = [T.FLOWER_R, T.FLOWER_Y, T.FLOWER_W, T.FLOWER_B];
+    const pick = palette[rng() * 4 | 0];
+    for (let k = 0; k < 18; k++) {
+      const x = clamp(bx + (((rng() - 0.5) * cr * 2) | 0), 1, WORLD_X - 2);
+      const z = clamp(bz + (((rng() - 0.5) * cr * 2) | 0), 1, WORLD_Z - 2);
+      const sy = surf(x, z);
+      if (sy <= SEA || getV(x, sy, z) !== B.GRASS) continue;
+      const tile = rng() < 0.55 ? pick : T.BLADE;
+      decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile });
+    }
+  }
+  // 16. sparse tufts of grass soften exposed dirt and gravel patches
+  for (let x = 0; x < WORLD_X; x++)
+    for (let z = 0; z < WORLD_Z; z++) {
+      const sy = surf(x, z);
+      if (sy <= SEA) continue;
+      const t = getV(x, sy, z);
+      if ((t === B.DIRT || t === B.GRAVEL) && rng() < 0.08)
+        decorations.push({ x: x + 0.5, y: sy + 1, z: z + 0.5, tile: T.BLADE });
+    }
+}
+
+// ---- top-down minimap HUD ----
+const mapCanvas = $("map"), mapCtx = mapCanvas.getContext("2d");
+const mapBase = document.createElement("canvas");
+mapBase.width = WORLD_X; mapBase.height = WORLD_Z;
+function initMinimap() {
+  const c = mapBase.getContext("2d");
+  const img = c.createImageData(WORLD_X, WORLD_Z);
+  const colOf = {};
+  colOf[B.WATER]=[40,90,150]; colOf[B.SAND]=[214,198,142]; colOf[B.GRASS]=[86,142,62];
+  colOf[B.STONE]=[128,128,134]; colOf[B.SNOW]=[236,242,252]; colOf[B.DIRT]=[124,92,56];
+  colOf[B.MOSSY]=[108,116,96]; colOf[B.GRAVEL]=[120,116,110]; colOf[B.LEAF]=[54,110,48];
+  colOf[B.PINELEAF]=[38,86,56]; colOf[B.WOOD]=[104,74,44]; colOf[B.PINEWOOD]=[78,56,36];
+  for (let z = 0; z < WORLD_Z; z++)
+    for (let x = 0; x < WORLD_X; x++) {
+      let sy = -1, v = B.AIR;
+      for (let y = WORLD_Y - 1; y >= 0; y--) { const bb = getV(x,y,z); if (bb !== B.AIR){ sy=y; v=bb; break; } }
+      const base = colOf[v] || [80,80,80];
+      const shade = 0.6 + 0.4 * clamp((sy - SEA) / 24, -0.4, 1);
+      const o = (z * WORLD_X + x) * 4;
+      img.data[o]=base[0]*shade; img.data[o+1]=base[1]*shade; img.data[o+2]=base[2]*shade; img.data[o+3]=255;
+    }
+  c.putImageData(img, 0, 0);
+}
+function drawMinimap(eye) {
+  mapCtx.imageSmoothingEnabled = false;
+  mapCtx.clearRect(0, 0, 150, 150);
+  mapCtx.drawImage(mapBase, 0, 0, 150, 150);
+  const mx = eye[0] / WORLD_X * 150, mz = eye[2] / WORLD_Z * 150;
+  const tx = 150 * center[0] / WORLD_X, tz = 150 * center[2] / WORLD_Z;
+  const ang = Math.atan2(tz - mz, tx - mx), half = 0.5, len = 26;
+  // view cone from the camera toward its focus
+  mapCtx.fillStyle = "rgba(255,207,63,.16)";
+  mapCtx.beginPath(); mapCtx.moveTo(mx, mz);
+  mapCtx.lineTo(mx + Math.cos(ang - half) * len, mz + Math.sin(ang - half) * len);
+  mapCtx.lineTo(mx + Math.cos(ang + half) * len, mz + Math.sin(ang + half) * len);
+  mapCtx.closePath(); mapCtx.fill();
+  mapCtx.strokeStyle = "rgba(255,207,63,.6)"; mapCtx.lineWidth = 1;
+  mapCtx.beginPath(); mapCtx.moveTo(mx, mz); mapCtx.lineTo(tx, tz); mapCtx.stroke();
+  // camera + focus markers
+  mapCtx.fillStyle = "#ffcf3f";
+  mapCtx.beginPath(); mapCtx.arc(mx, mz, 3.5, 0, TAU); mapCtx.fill();
+  mapCtx.strokeStyle = "rgba(0,0,0,.6)"; mapCtx.lineWidth = 1; mapCtx.stroke();
+  mapCtx.fillStyle = "rgba(255,255,255,.7)";
+  mapCtx.beginPath(); mapCtx.arc(tx, tz, 2, 0, TAU); mapCtx.fill();
+  // compass rose
+  mapCtx.font = "9px ui-monospace, monospace";
+  mapCtx.textAlign = "center"; mapCtx.textBaseline = "middle";
+  mapCtx.fillStyle = "rgba(159,196,255,.9)";
+  mapCtx.fillText("N", 10, 10); mapCtx.fillText("S", 10, 140);
+  mapCtx.fillText("W", 140, 10); mapCtx.fillText("E", 140, 140);
+  // scale bar (10 voxels)
+  const scalePx = 10 / WORLD_X * 150;
+  mapCtx.strokeStyle = "rgba(255,255,255,.8)"; mapCtx.lineWidth = 2;
+  mapCtx.beginPath(); mapCtx.moveTo(8, 144); mapCtx.lineTo(8 + scalePx, 144); mapCtx.stroke();
+  mapCtx.fillStyle = "rgba(255,255,255,.8)";
+  mapCtx.fillText("10", 8 + scalePx + 8, 144);
+}
+initMinimap();
+
+function makeVAO(data, layout) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  let stride = 0; for (const a of layout) stride += a.size * 4;
+  let off = 0;
+  for (const a of layout) {
+    gl.enableVertexAttribArray(a.loc);
+    gl.vertexAttribPointer(a.loc, a.size, gl.FLOAT, false, stride, off);
+    off += a.size * 4;
+  }
+  gl.bindVertexArray(null);
+  return { vao, count: data.length / (stride / 4) };
+}
+const terrainVAO = makeVAO(meshes.opaque, [{loc:0,size:3},{loc:1,size:2},{loc:2,size:3},{loc:3,size:1}]);
+const waterVAO   = makeVAO(meshes.water,  [{loc:0,size:3},{loc:1,size:2},{loc:2,size:3},{loc:3,size:1}]);
+const decoVAO    = makeVAO(decoData,      [{loc:0,size:3},{loc:1,size:2}]);
+
+// particle seed buffers
+function makeParticles(n) {
+  const rng = makeRng(424242 + n);
+  const data = new Float32Array(n * 3);
+  for (let i = 0; i < n * 3; i++) data[i] = rng();
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return { vao, count: n };
+}
+const birds = makeParticles(40);
+const pollen = makeParticles(260);
+
+// ---- fauna & weather: CPU-simulated sprites ----
+const surfaceY = (x, z) => { for (let y = WORLD_Y - 1; y >= 0; y--) if (getV(x, y, z) !== B.AIR) return y; return 0; };
+const N_BOID = 24, N_BUTTER = 26, N_LEAF = 90, N_SNOW = 160, N_FIRE = 70;
+const N_NORMAL = N_BOID + N_BUTTER + N_LEAF + N_SNOW;
+const N_SPRITE = N_NORMAL + N_FIRE;
+const spriteData = new Float32Array(N_SPRITE * 8);
+const srng = makeRng(73101);
+let lastNow = 0;
+const cx0 = WORLD_X / 2, cz0 = WORLD_Z / 2;
+
+const bo = { x:new Float32Array(N_BOID), y:new Float32Array(N_BOID), z:new Float32Array(N_BOID),
+             vx:new Float32Array(N_BOID), vy:new Float32Array(N_BOID), vz:new Float32Array(N_BOID) };
+for (let i = 0; i < N_BOID; i++) {
+  bo.x[i] = cx0 + (srng()-0.5)*40; bo.y[i] = SEA + 28 + srng()*14; bo.z[i] = cz0 + (srng()-0.5)*40;
+  bo.vx[i] = srng()-0.5; bo.vy[i] = (srng()-0.5)*0.2; bo.vz[i] = srng()-0.5;
+}
+const bf = [];
+for (let i = 0; i < N_BUTTER; i++) {
+  const ax = 8 + srng()*(WORLD_X-16), az = 8 + srng()*(WORLD_Z-16);
+  bf.push({ ax, az, ay: surfaceY(ax|0, az|0) + 2 + srng()*3, ph: srng()*TAU, sp: 0.5 + srng(), r: srng()*0.5 + 0.5 });
+}
+const ff = [];
+for (let i = 0; i < N_FIRE; i++) {
+  const ax = 8 + srng()*(WORLD_X-16), az = 8 + srng()*(WORLD_Z-16);
+  ff.push({ ax, az, ay: surfaceY(ax|0, az|0) + 1 + srng()*4, ph: srng()*TAU, sp: 0.4 + srng()*0.8 });
+}
+const pc = { x:new Float32Array(N_LEAF+N_SNOW), y:new Float32Array(N_LEAF+N_SNOW),
+             z:new Float32Array(N_LEAF+N_SNOW), ph:new Float32Array(N_LEAF+N_SNOW) };
+for (let i = 0; i < N_LEAF + N_SNOW; i++) {
+  pc.x[i] = srng()*WORLD_X; pc.y[i] = SEA + srng()*30; pc.z[i] = srng()*WORLD_Z; pc.ph[i] = srng()*TAU;
+}
+
+const spriteVAO = gl.createVertexArray();
+gl.bindVertexArray(spriteVAO);
+const spriteBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, spriteBuf);
+gl.bufferData(gl.ARRAY_BUFFER, spriteData.byteLength, gl.DYNAMIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 32, 0);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 32, 12);
+gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 2, gl.FLOAT, false, 32, 24);
+gl.bindVertexArray(null);
+
+function setSprite(i, x, y, z, r, g, bl, size, alpha) {
+  const o = i * 8;
+  spriteData[o]=x; spriteData[o+1]=y; spriteData[o+2]=z;
+  spriteData[o+3]=r; spriteData[o+4]=g; spriteData[o+5]=bl;
+  spriteData[o+6]=size; spriteData[o+7]=alpha;
+}
+function updateSprites(elapsed, dt, night) {
+  dt = Math.min(dt, 0.05);
+  let s = 0;
+  // boids: classic separation / alignment / cohesion
+  for (let i = 0; i < N_BOID; i++) {
+    let sx=0, sy=0, sz=0, ax=0, ay=0, az=0, cx=0, cy=0, cz=0, cnt=0;
+    for (let j = 0; j < N_BOID; j++) {
+      if (j === i) continue;
+      const dx = bo.x[j]-bo.x[i], dy = bo.y[j]-bo.y[i], dz = bo.z[j]-bo.z[i];
+      const d2 = dx*dx + dy*dy + dz*dz;
+      if (d2 < 200) {
+        cnt++; cx+=bo.x[j]; cy+=bo.y[j]; cz+=bo.z[j]; ax+=bo.vx[j]; ay+=bo.vy[j]; az+=bo.vz[j];
+        if (d2 < 28 && d2 > 0.001) { sx-=dx/d2; sy-=dy/d2; sz-=dz/d2; }
+      }
+    }
+    if (cnt > 0) {
+      cx = cx/cnt - bo.x[i]; cy = cy/cnt - bo.y[i]; cz = cz/cnt - bo.z[i];
+      ax/=cnt; ay/=cnt; az/=cnt;
+      bo.vx[i] += cx*0.0008 + (ax-bo.vx[i])*0.02 + sx*0.6;
+      bo.vy[i] += cy*0.0008 + (ay-bo.vy[i])*0.02 + sy*0.6;
+      bo.vz[i] += cz*0.0008 + (az-bo.vz[i])*0.02 + sz*0.6;
+    }
+    bo.vx[i] += (cx0 - bo.x[i])*0.0009 + Math.sin(elapsed*0.7 + i)*0.02;
+    bo.vz[i] += (cz0 - bo.z[i])*0.0009;
+    bo.vy[i] += ((SEA+30) - bo.y[i])*0.0012;
+    const sp = Math.hypot(bo.vx[i], bo.vy[i], bo.vz[i]) || 1, mx = 7;
+    if (sp > mx) { bo.vx[i]*=mx/sp; bo.vy[i]*=mx/sp; bo.vz[i]*=mx/sp; }
+    bo.x[i] += bo.vx[i]*dt*6; bo.y[i] += bo.vy[i]*dt*6; bo.z[i] += bo.vz[i]*dt*6;
+    setSprite(s++, bo.x[i], bo.y[i], bo.z[i], 0.05, 0.06, 0.09, 3.2, 1.0);
+  }
+  // butterflies
+  for (let i = 0; i < N_BUTTER; i++) {
+    const b = bf[i], t = elapsed*b.sp + b.ph;
+    const x = b.ax + Math.cos(t)*3, z = b.az + Math.sin(t*1.3)*3, y = b.ay + Math.sin(t*2.0)*0.8;
+    const flap = 0.5 + 0.5*Math.sin(t*8.0);
+    setSprite(s++, x, y, z, 0.9*b.r+0.1, 0.4+0.4*b.r, 0.7-0.3*b.r, 2.2+flap, 0.95);
+  }
+  // falling leaves (warm)
+  for (let i = 0; i < N_LEAF; i++) {
+    pc.y[i] -= dt*3.0; pc.x[i] += Math.sin(elapsed*0.6 + pc.ph[i])*dt*1.5;
+    if (pc.y[i] < SEA) { pc.x[i] = srng()*WORLD_X; pc.z[i] = srng()*WORLD_Z; pc.y[i] = SEA + 24 + srng()*8; }
+    setSprite(s++, pc.x[i], pc.y[i], pc.z[i], 0.75, 0.45, 0.2, 2.4, 0.9);
+  }
+  // snow (white, settles from above the peaks)
+  for (let i = N_LEAF; i < N_LEAF + N_SNOW; i++) {
+    pc.y[i] -= dt*2.0; pc.x[i] += Math.sin(elapsed*0.4 + pc.ph[i])*dt*1.0;
+    if (pc.y[i] < SEA + 10) { pc.x[i] = srng()*WORLD_X; pc.z[i] = srng()*WORLD_Z; pc.y[i] = WORLD_Y + srng()*6; }
+    setSprite(s++, pc.x[i], pc.y[i], pc.z[i], 0.95, 0.97, 1.0, 2.0, 0.85);
+  }
+  // fireflies (additive, only at night)
+  for (let i = 0; i < N_FIRE; i++) {
+    const f = ff[i], t = elapsed*f.sp + f.ph;
+    const x = f.ax + Math.cos(t)*2.2, z = f.az + Math.sin(t*1.1)*2.2, y = f.ay + Math.sin(t*1.7)*1.2;
+    const glow = (0.4 + 0.6*Math.abs(Math.sin(t*3.0))) * night;
+    setSprite(s++, x, y, z, 1.0, 0.9, 0.4, 2.6, glow);
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, spriteBuf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, spriteData);
+}
+
+// fullscreen triangle (sky) and quad (post)
+const fsTri = gl.createVertexArray();
+gl.bindVertexArray(fsTri);
+let b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+const fsQuad = gl.createVertexArray();
+gl.bindVertexArray(fsQuad);
+b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+// atlas texture
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, buildAtlas());
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.generateMipmap(gl.TEXTURE_2D);
+
+// shadow map (depth texture in a framebuffer)
+const SHADOW = 2048;
+const shadowTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SHADOW, SHADOW, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.NONE);
+const shadowFBO = gl.createFramebuffer();
+gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
+gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE);
+if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fatal("Shadow FBO incomplete.");
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+// scene color target (recreated on resize)
+let sceneFBO = null, sceneColor = null, sceneDepth = null, sceneW = 0, sceneH = 0;
+function ensureSceneTarget(w, h) {
+  if (w === sceneW && h === sceneH && sceneFBO) return;
+  sceneW = w; sceneH = h;
+  if (sceneFBO) { gl.deleteFramebuffer(sceneFBO); gl.deleteTexture(sceneColor); gl.deleteRenderbuffer(sceneDepth); }
+  sceneColor = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, sceneColor);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  sceneDepth = gl.createRenderbuffer();
+  gl.bindRenderbuffer(gl.RENDERBUFFER, sceneDepth);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, w, h);
+  sceneFBO = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, sceneColor, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, sceneDepth);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fatal("Scene FBO incomplete.");
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// bloom ping-pong targets (half resolution)
+let bloomFBO = [null, null], bloomTex = [null, null], bloomW = 0, bloomH = 0;
+function ensureBloomTargets(w, h) {
+  const bw = Math.max(1, w >> 1), bh = Math.max(1, h >> 1);
+  if (bw === bloomW && bh === bloomH && bloomFBO[0]) return;
+  bloomW = bw; bloomH = bh;
+  for (let i = 0; i < 2; i++) {
+    if (bloomFBO[i]) { gl.deleteFramebuffer(bloomFBO[i]); gl.deleteTexture(bloomTex[i]); }
+    bloomTex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, bloomTex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, bw, bh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    bloomFBO[i] = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBO[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, bloomTex[i], 0);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+/* -------------------------------------------------------------------------------------
+   9. Camera, matrices, day/night palette
+   ------------------------------------------------------------------------------------- */
+const proj = M4.create(), view = M4.create(), vp = M4.create(), invVP = M4.create();
+const lightView = M4.create(), lightProj = M4.create(), lightVP = M4.create();
+const center = [WORLD_X/2, SEA + 8, WORLD_Z/2];
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.floor(window.innerWidth * dpr), h = Math.floor(window.innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+}
+window.addEventListener("resize", resize);
+resize();
+
+function skyPalette(t) {
+  const day   = { top:[0.30,0.55,0.92], bot:[0.74,0.86,0.97], sun:[1.00,0.97,0.86], amb:[0.42,0.46,0.55] };
+  const dusk  = { top:[0.20,0.18,0.42], bot:[0.96,0.55,0.30], sun:[1.00,0.55,0.28], amb:[0.32,0.27,0.34] };
+  const night = { top:[0.02,0.03,0.10], bot:[0.05,0.07,0.18], sun:[0.55,0.62,0.85], amb:[0.11,0.13,0.24] };
+  let a, b, k;
+  if (t < 0.25)      { a=dusk;  b=day;   k=t/0.25; }
+  else if (t < 0.5)  { a=day;   b=dusk;  k=(t-0.25)/0.25; }
+  else if (t < 0.6)  { a=dusk;  b=night; k=(t-0.5)/0.1; }
+  else if (t < 0.9)  { a=night; b=night; k=0; }
+  else               { a=night; b=dusk;  k=(t-0.9)/0.1; }
+  const m = (p,q)=>[lerp(p[0],q[0],k),lerp(p[1],q[1],k),lerp(p[2],q[2],k)];
+  return { top:m(a.top,b.top), bot:m(a.bot,b.bot), sun:m(a.sun,b.sun), amb:m(a.amb,b.amb) };
+}
+
+/* -------------------------------------------------------------------------------------
+   10. Render loop
+   ------------------------------------------------------------------------------------- */
+gl.enable(gl.DEPTH_TEST);
+gl.enable(gl.CULL_FACE);
+gl.cullFace(gl.BACK);
+gl.frontFace(gl.CCW);
+
+const start = performance.now();
+let frames = 0, lastFpsT = start, drawCalls = 0;
+
+function drawScene(camVP, eye, pal, sunDir, night, elapsed, shadowOn) {
+  // sky
+  gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+  gl.useProgram(progSky);
+  gl.uniformMatrix4fv(uS.uInvVP, false, invVP);
+  gl.uniform3fv(uS.uSunDir, sunDir);
+  gl.uniform3fv(uS.uTop, pal.top); gl.uniform3fv(uS.uBottom, pal.bot);
+  gl.uniform3fv(uS.uSunColor, pal.sun);
+  gl.uniform1f(uS.uTime, elapsed); gl.uniform1f(uS.uNight, night);
+  gl.bindVertexArray(fsTri); gl.drawArrays(gl.TRIANGLES, 0, 3); drawCalls++;
+  gl.depthMask(true); gl.enable(gl.DEPTH_TEST);
+
+  // terrain (shadowed)
+  gl.useProgram(progTerrain);
+  gl.uniformMatrix4fv(uT.uVP, false, camVP);
+  gl.uniformMatrix4fv(uT.uLightVP, false, lightVP);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(uT.uTex, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, shadowTex); gl.uniform1i(uT.uShadow, 1);
+  gl.uniform3fv(uT.uSunDir, sunDir); gl.uniform3fv(uT.uSunColor, pal.sun);
+  gl.uniform3fv(uT.uAmbient, pal.amb); gl.uniform3fv(uT.uFogColor, pal.bot);
+  gl.uniform3fv(uT.uCamPos, eye); gl.uniform1f(uT.uFogDensity, 0.0055);
+  gl.uniform1f(uT.uShadowOn, shadowOn);
+  gl.bindVertexArray(terrainVAO.vao); gl.drawArrays(gl.TRIANGLES, 0, terrainVAO.count); drawCalls++;
+
+  // decorations (alpha cut, double-sided)
+  gl.disable(gl.CULL_FACE);
+  gl.useProgram(progDeco);
+  gl.uniformMatrix4fv(uDe.uVP, false, camVP);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(uDe.uTex, 0);
+  gl.uniform3fv(uDe.uSunColor, pal.sun); gl.uniform3fv(uDe.uAmbient, pal.amb);
+  gl.uniform3fv(uDe.uFogColor, pal.bot); gl.uniform3fv(uDe.uCamPos, eye);
+  gl.uniform1f(uDe.uFogDensity, 0.0055);
+  gl.bindVertexArray(decoVAO.vao); gl.drawArrays(gl.TRIANGLES, 0, decoVAO.count); drawCalls++;
+  gl.enable(gl.CULL_FACE);
+
+  // water (transparent)
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+  gl.useProgram(progWater);
+  gl.uniformMatrix4fv(uW.uVP, false, camVP); gl.uniform1f(uW.uTime, elapsed);
+  gl.uniform3fv(uW.uSunDir, sunDir); gl.uniform3fv(uW.uSunColor, pal.sun);
+  gl.uniform3fv(uW.uCamPos, eye); gl.uniform3fv(uW.uFogColor, pal.bot);
+  gl.uniform1f(uW.uFogDensity, 0.0055);
+  gl.bindVertexArray(waterVAO.vao); gl.drawArrays(gl.TRIANGLES, 0, waterVAO.count); drawCalls++;
+
+  // particles
+  gl.useProgram(progPart);
+  gl.uniformMatrix4fv(uP.uVP, false, camVP); gl.uniform1f(uP.uTime, elapsed);
+  gl.uniform3fv(uP.uCenter, center); gl.uniform3fv(uP.uSunColor, pal.sun);
+  // birds (opaque-ish)
+  gl.uniform1f(uP.uMode, 0.0);
+  gl.bindVertexArray(birds.vao); gl.drawArrays(gl.POINTS, 0, birds.count); drawCalls++;
+  // pollen (additive)
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  gl.uniform1f(uP.uMode, 1.0);
+  gl.bindVertexArray(pollen.vao); gl.drawArrays(gl.POINTS, 0, pollen.count); drawCalls++;
+  // fauna & weather sprites (normal-blended group, then additive fireflies)
+  gl.useProgram(progSprite);
+  gl.uniformMatrix4fv(uSp.uVP, false, camVP);
+  gl.bindVertexArray(spriteVAO);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.drawArrays(gl.POINTS, 0, N_NORMAL); drawCalls++;
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+  gl.drawArrays(gl.POINTS, N_NORMAL, N_FIRE); drawCalls++;
+  gl.depthMask(true); gl.disable(gl.BLEND);
+  gl.bindVertexArray(null);
+}
+
+function frame(now) {
+  const elapsed = (now - start) / 1000;
+  resize();
+  drawCalls = 0;
+
+  // day/night
+  const dayLen = 54;
+  const tod = fract(elapsed / dayLen);
+  const sunAngle = tod * TAU - Math.PI * 0.5;
+  let sunDir = V3.norm([Math.cos(sunAngle), Math.sin(sunAngle) * 0.95 + 0.04, 0.32]);
+  const pal = skyPalette(tod);
+  const night = clamp((tod > 0.5 ? (tod - 0.5) / 0.12 : 0) - (tod > 0.88 ? (tod - 0.88) / 0.12 : 0), 0, 1);
+  const sunUp = sunDir[1] > 0.06;
+  const shadowOn = sunUp ? 1.0 : 0.0;
+
+  const dt = lastNow ? (now - lastNow) / 1000 : 0.016; lastNow = now;
+  updateSprites(elapsed, dt, night);
+
+  // camera orbit
+  const aspect = canvas.width / canvas.height;
+  const orbit = elapsed * 0.055;
+  const radius = 92 + Math.sin(elapsed * 0.11) * 12;
+  const camY = SEA + 30 + Math.sin(elapsed * 0.19) * 7;
+  const eye = [center[0] + Math.cos(orbit) * radius, camY, center[2] + Math.sin(orbit) * radius];
+  M4.perspective(proj, 1.05, aspect, 0.1, 500);
+  M4.lookAt(view, eye, center, [0,1,0]);
+  M4.multiply(vp, proj, view);
+  M4.invert(invVP, vp);
+
+  // light matrix (orthographic, aimed along sun direction at the world centre)
+  const ld = sunUp ? sunDir : [0.3, 0.9, 0.2];
+  const lightPos = V3.add(center, V3.scale(ld, 130));
+  let up = [0,1,0];
+  if (Math.abs(ld[1]) > 0.98) up = [0,0,1];
+  M4.lookAt(lightView, lightPos, center, up);
+  const S = 95;
+  M4.ortho(lightProj, -S, S, -S, S, 1, 300);
+  M4.multiply(lightVP, lightProj, lightView);
+
+  // ---- pass 1: shadow depth ----
+  if (sunUp) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFBO);
+    gl.viewport(0, 0, SHADOW, SHADOW);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.cullFace(gl.FRONT); // reduce peter-panning / acne
+    gl.useProgram(progDepth);
+    gl.uniformMatrix4fv(uD.uLightVP, false, lightVP);
+    gl.bindVertexArray(terrainVAO.vao);
+    gl.drawArrays(gl.TRIANGLES, 0, terrainVAO.count); drawCalls++;
+    gl.cullFace(gl.BACK);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  // ---- pass 2: scene into offscreen colour target ----
+  ensureSceneTarget(canvas.width, canvas.height);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, sceneFBO);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(pal.bot[0], pal.bot[1], pal.bot[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  drawScene(vp, eye, pal, sunDir, night, elapsed, shadowOn);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // ---- pass 3: bloom extraction + separable Gaussian blur ----
+  ensureBloomTargets(canvas.width, canvas.height);
+  gl.disable(gl.DEPTH_TEST); gl.depthMask(false);
+  gl.viewport(0, 0, bloomW, bloomH);
+  gl.bindVertexArray(fsQuad);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBO[0]);
+  gl.useProgram(progBright);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneColor); gl.uniform1i(uBr.uScene, 0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6); drawCalls++;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBO[1]);
+  gl.useProgram(progBlur);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, bloomTex[0]); gl.uniform1i(uBl.uTex, 0);
+  gl.uniform2f(uBl.uDir, 1.0 / bloomW, 0.0);
+  gl.drawArrays(gl.TRIANGLES, 0, 6); drawCalls++;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, bloomFBO[0]);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, bloomTex[1]); gl.uniform1i(uBl.uTex, 0);
+  gl.uniform2f(uBl.uDir, 0.0, 1.0 / bloomH);
+  gl.drawArrays(gl.TRIANGLES, 0, 6); drawCalls++;
+
+  // ---- pass 4: composite (FXAA + bloom + ACES tonemap + vignette) to screen ----
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.useProgram(progPost);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, sceneColor); gl.uniform1i(uPo.uScene, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomTex[0]); gl.uniform1i(uPo.uBloom, 1);
+  gl.uniform2f(uPo.uTexel, 1.0 / canvas.width, 1.0 / canvas.height);
+  {
+    const sxw = eye[0] + sunDir[0]*300, syw = eye[1] + sunDir[1]*300, szw = eye[2] + sunDir[2]*300;
+    const ccx = vp[0]*sxw + vp[4]*syw + vp[8]*szw + vp[12];
+    const ccy = vp[1]*sxw + vp[5]*syw + vp[9]*szw + vp[13];
+    const ccw = vp[3]*sxw + vp[7]*syw + vp[11]*szw + vp[15];
+    let svis = 0, sux = 0.5, suy = 0.5;
+    if (ccw > 0 && sunDir[1] > 0.05) {
+      sux = (ccx/ccw)*0.5 + 0.5; suy = (ccy/ccw)*0.5 + 0.5;
+      if (sux > -0.3 && sux < 1.3 && suy > -0.3 && suy < 1.3) svis = clamp(sunDir[1]*1.4, 0, 1);
+    }
+    gl.uniform2f(uPo.uSunScreen, sux, suy);
+    gl.uniform1f(uPo.uSunVis, svis);
+  }
+  gl.bindVertexArray(fsQuad); gl.drawArrays(gl.TRIANGLES, 0, 6); drawCalls++;
+  gl.bindVertexArray(null);
+  gl.depthMask(true); gl.enable(gl.DEPTH_TEST);
+
+  // HUD
+  frames++;
+  if (now - lastFpsT >= 500) {
+    $("h-fps").textContent = Math.round(frames * 1000 / (now - lastFpsT));
+    frames = 0; lastFpsT = now;
+  }
+  $("h-dc").textContent = drawCalls;
+  const hh = (Math.floor(tod * 24) + 6) % 24, mm = Math.floor(fract(tod * 24) * 60);
+  $("h-tod").textContent = String(hh).padStart(2,"0") + ":" + String(mm).padStart(2,"0");
+  $("h-bar").style.width = (tod * 100).toFixed(0) + "%";
+  drawMinimap(eye);
+
+  requestAnimationFrame(frame);
+}
+
+$("h-vox").textContent = voxelCount.toLocaleString();
+$("h-tri").textContent = (meshes.triCount + decoData.length / 5 / 3 + birds.count + pollen.count + N_SPRITE).toLocaleString();
+
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
